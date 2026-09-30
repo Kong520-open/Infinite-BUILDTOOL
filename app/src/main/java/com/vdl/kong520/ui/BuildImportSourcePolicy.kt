@@ -19,19 +19,14 @@ internal object BuildImportSourcePolicy {
         "infinity",
         "ibuild"
     )
-    private val limitedStructureExtensions = setOf("schematic", "schem")
     private val pixelArtExtensions = setOf("png", "jpg", "jpeg")
 
-    fun accepts(fileName: String, mode: BuildImportSourceMode, limited: Boolean = false): Boolean {
+    fun accepts(fileName: String, mode: BuildImportSourceMode): Boolean {
         val extension = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
         if (extension.isEmpty()) return false
         return when (mode) {
-            BuildImportSourceMode.STRUCTURE -> extension in if (limited) {
-                limitedStructureExtensions
-            } else {
-                structureExtensions
-            }
-            BuildImportSourceMode.PIXEL_ART -> !limited && extension in pixelArtExtensions
+            BuildImportSourceMode.STRUCTURE -> extension in structureExtensions
+            BuildImportSourceMode.PIXEL_ART -> extension in pixelArtExtensions
         }
     }
 

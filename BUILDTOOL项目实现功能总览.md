@@ -16,7 +16,7 @@ Android 模块位于 `app/`；应用 ID 为 `com.kong.buildtool`，最低 Androi
 4. `native-lib.cpp` 在 `JNI_OnLoad` 注册上述 JNI 方法，等待 `libminecraftpe.so`，并初始化命令发送、回执、游戏 tick 和投影渲染所需的 hook。
 5. `TpModule.cpp` 提供导入、投影、导出等操作的 JNI 接口；具体运行状态由 `build_import/` 下的模块管理。
 
-建筑工具入口不要求账号登录或远程许可验证。导入操作使用完整访问配置。应用清单没有 `INTERNET` 和 `ACCESS_NETWORK_STATE` 权限。
+建筑工具入口不要求账号登录或远程许可验证。应用清单没有 `INTERNET` 和 `ACCESS_NETWORK_STATE` 权限。命令操作由游戏或服务器检查权限；投影打印使用玩家已有的材料。
 
 ## 功能与源码
 
@@ -30,6 +30,19 @@ Android 模块位于 `app/`；应用 ID 为 `com.kong.buildtool`，最低 Androi
 结构文件解析和写入分布在 `build_import/BdxParser.cpp`、`BdxWriter.cpp`、`SchematicParser.cpp`、`SchematicWriter.cpp`、`LitematicParser.cpp`、`McworldParser.cpp` 等文件。MIDI 和命令音乐解析由同目录中的 `MidiCommandMusicParser.cpp` 与 `CommandMusicParser.cpp` 实现。
 
 游戏函数地址集中在 `tp/FunctionsAddress.cpp` 及相关 ABI 配置中。构建使用 Dobby、Brotli 和 OpenSSL。建筑功能通过 `tp/PythonUtils` 调用游戏内的 Python 接口；项目不单独编译 Python 解释器。修改 hook 或支持的游戏版本时，应核对当前源码中的地址和签名。
+
+## `tp/` 目录职责
+
+| 文件 | 建筑工具中的用途 |
+| --- | --- |
+| `TpModule.cpp`、`TpModule.h` | 建筑导入、图片导入、投影、打印、导出的 JNI 接口注册与参数处理 |
+| `MinecraftUpdateHook.cpp`、`MinecraftUpdateHook.h` | 在游戏线程驱动建筑任务、查询世界与玩家上下文、处理导出区域间的移动 |
+| `PythonUtils.h` | 调用游戏内 Python 的建筑操作桥接 |
+| `BuildPacketReceiveHook.cpp`、`BuildPacketReceiveHook.h` | 处理建筑命令回执、容器同步、地图与告示牌数据 |
+| `LoopbackPacketSenderCapture.cpp`、`LoopbackPacketSenderCapture.h` | 获取建筑操作使用的发送器并跟踪相关数据包 |
+| `FunctionsAddress.cpp`、`FunctionsAddress.h`、`FunctionUtils.h` | 建筑功能依赖的游戏函数地址与类型化调用 |
+
+导出时的区域移动使用服务器 `/tp` 命令，只移动当前玩家。任务通过实际坐标变化确认到达目标，并检查世界与维度是否仍匹配；服务器拒绝命令时不会伪造移动成功。
 
 ## 构建
 

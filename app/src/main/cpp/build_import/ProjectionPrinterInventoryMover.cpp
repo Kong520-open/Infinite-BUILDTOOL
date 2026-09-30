@@ -10,7 +10,6 @@
 #include "ProjectionPrinterInventoryMailbox.h"
 
 #include "../main.h"
-#include "../native_auth.h"
 #include "../tp/LoopbackPacketSenderCapture.h"
 #include "../tp/MinecraftUpdateHook.h"
 
@@ -1283,7 +1282,7 @@ bool CaptureMapAnvilLocalInputSlotPackets(
     return fail(error, "anvil local input capture requires Android arm64-v8a");
 #else
     if (!source_occupied_packet || !anvil_occupied_packet ||
-        !IsMinecraftUpdateGameThread() || !IsNativeSessionAuthorized() ||
+        !IsMinecraftUpdateGameThread() ||
         source_hotbar_slot < 0 || source_hotbar_slot > 8 ||
         expected_network_stack_id <= 0 || expected_runtime_item_id <= 0 ||
         expected_map_uuid == -1 || anvil_window_id == 0U ||
@@ -2366,9 +2365,8 @@ bool SendFilledMapToSingleChest(
     (void)request;
     return fail(error, "filled-map chest storage is supported only on arm64-v8a");
 #else
-    if (!submission || !IsMinecraftUpdateGameThread() ||
-        !IsNativeSessionAuthorized()) {
-        return fail(error, "filled-map chest storage requires an authorized local-player tick");
+    if (!submission || !IsMinecraftUpdateGameThread()) {
+        return fail(error, "filled-map chest storage requires a local-player tick");
     }
     std::string current_world;
     if (!QueryWorldContextOnGameThread(&current_world, 1000)) {
@@ -2662,9 +2660,8 @@ bool SendMapAnvilInputPlace(const MapAnvilInputPlaceRequest& request,
     (void)request;
     return fail(error, "anvil input Place is supported only on arm64-v8a");
 #else
-    if (!submission || !IsMinecraftUpdateGameThread() ||
-        !IsNativeSessionAuthorized()) {
-        return fail(error, "anvil input Place requires an authorized local-player tick");
+    if (!submission || !IsMinecraftUpdateGameThread()) {
+        return fail(error, "anvil input Place requires a local-player tick");
     }
     MapAnvilInputDraft draft;
     if (!loadAnvilInputEvidence(request, &draft, error)) return false;

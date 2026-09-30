@@ -82,7 +82,8 @@ bool BuildImportCheckpoint::saveAtomically(const std::string& path,
         static_cast<uint8_t>(snapshot.config.verification_precision);
     const uint8_t place_deny_layer = snapshot.config.place_deny_layer ? 1 : 0;
     const uint8_t source_type = static_cast<uint8_t>(snapshot.config.source_type);
-    const uint8_t access_profile = static_cast<uint8_t>(snapshot.config.access_profile);
+    // Keep this reserved byte so existing checkpoint layouts remain readable.
+    const uint8_t reserved_flags = 0;
     const uint8_t create_maps_after_import =
         snapshot.config.create_maps_after_import ? 1 : 0;
     const bool success =
@@ -124,7 +125,7 @@ bool BuildImportCheckpoint::saveAtomically(const std::string& path,
          writeValue(stream, snapshot.config.deny_layer_bounds.max_y) &&
          writeValue(stream, snapshot.config.deny_layer_bounds.max_z) &&
          writeValue(stream, source_type) &&
-         writeValue(stream, access_profile) &&
+         writeValue(stream, reserved_flags) &&
          writeValue(stream, create_maps_after_import);
     stream.flush();
     const bool flushed = static_cast<bool>(stream);
@@ -157,7 +158,7 @@ std::optional<CheckpointSnapshot> BuildImportCheckpoint::load(const std::string&
         static_cast<uint8_t>(VerificationPrecision::Thorough);
     uint8_t place_deny_layer = 0;
     uint8_t source_type = static_cast<uint8_t>(ImportSourceType::Schematic);
-    uint8_t access_profile = static_cast<uint8_t>(BuildToolsAccessProfile::Full);
+    uint8_t reserved_flags = 0;
     uint8_t create_maps_after_import = 0;
     CheckpointSnapshot snapshot;
 
@@ -210,7 +211,7 @@ std::optional<CheckpointSnapshot> BuildImportCheckpoint::load(const std::string&
                    readValue(stream, &snapshot.config.deny_layer_bounds.max_z);
     }
     if (success && version >= 12) {
-        success = readValue(stream, &source_type) && readValue(stream, &access_profile);
+        success = readValue(stream, &source_type) && readValue(stream, &reserved_flags);
     }
     if (success && version >= 13) {
         success = readValue(stream, &create_maps_after_import);
@@ -227,12 +228,9 @@ std::optional<CheckpointSnapshot> BuildImportCheckpoint::load(const std::string&
         snapshot.config.place_deny_layer = false;
         snapshot.config.deny_layer_bounds = {};
     }
-    // Legacy checkpoints were created before restricted import existed.  They
-    // remain usable with a full ticket but must not become eligible for the
-    // limited profile simply because their file happens to end in .schem.
+    // Checkpoints before v12 have no explicit source-type field.
     if (version < 12) {
         snapshot.config.source_type = ImportSourceType::Schematic;
-        snapshot.config.access_profile = BuildToolsAccessProfile::Full;
     }
 
     char trailing_byte = 0;
@@ -248,7 +246,7 @@ std::optional<CheckpointSnapshot> BuildImportCheckpoint::load(const std::string&
         place_deny_layer > 1 || create_maps_after_import > 1 ||
          verification_precision > static_cast<uint8_t>(VerificationPrecision::Thorough) ||
           source_type > static_cast<uint8_t>(ImportSourceType::CommandMusicMidi) ||
-         access_profile > static_cast<uint8_t>(BuildToolsAccessProfile::LimitedImport) ||
+         reserved_flags > 1 ||
         (create_maps_after_import != 0 &&
          source_type != static_cast<uint8_t>(ImportSourceType::PixelArtPng)) ||
         policy > static_cast<uint8_t>(OverwritePolicy::ClearImportedBounds) ||
@@ -274,7 +272,6 @@ std::optional<CheckpointSnapshot> BuildImportCheckpoint::load(const std::string&
         static_cast<VerificationPrecision>(verification_precision);
     snapshot.config.place_deny_layer = place_deny_layer != 0;
     snapshot.config.source_type = static_cast<ImportSourceType>(source_type);
-    snapshot.config.access_profile = static_cast<BuildToolsAccessProfile>(access_profile);
     snapshot.config.create_maps_after_import = create_maps_after_import != 0;
     snapshot.format_version = version;
     snapshot.state = static_cast<ImportState>(state);

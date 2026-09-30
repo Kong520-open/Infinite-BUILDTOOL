@@ -1,5 +1,4 @@
 #include "BuildProjectionRenderer.h"
-#include "../native_auth.h"
 
 #include "BuildImportTypes.h"
 #include "BuildProjectionOutline.h"
@@ -4479,7 +4478,6 @@ bool BuildProjectionRenderer::clearPlanAndWaitForRender(uint32_t timeout_ms) {
 }
 
 void BuildProjectionRenderer::setEnabled(bool enabled) {
-    if (enabled && !IsBuildToolsAuthorized()) return;
     g_enabled.store(enabled, std::memory_order_release);
     if (!enabled) clearReachabilityPreview();
 }
@@ -4837,12 +4835,6 @@ void BuildProjectionRenderer::render() {
         // exact EGL context. Background reloads may now safely create their
         // new disk and texture state without overlapping the retired plan.
         acknowledgePlanClearOnRenderThread();
-    }
-    // Capability lookup is a lock-free ticket snapshot; any refresh is
-    // single-flight and asynchronous, so an expired ticket turns rendering off
-    // without performing network I/O on the frame thread.
-    if (!IsBuildToolsAuthorized()) {
-        g_enabled.store(false, std::memory_order_release);
     }
     if (!g_render_plan || !g_enabled.load(std::memory_order_acquire)) {
         clearProjectionWorldMatchInterest();

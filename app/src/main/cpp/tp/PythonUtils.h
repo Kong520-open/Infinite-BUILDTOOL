@@ -1,9 +1,5 @@
-//
-// Created by ASUS on 2025/5/17.
-//
-
-#ifndef OCEAN_PYTHONUTILS_H
-#define OCEAN_PYTHONUTILS_H
+#ifndef BUILD_TOOL_PYTHON_UTILS_H
+#define BUILD_TOOL_PYTHON_UTILS_H
 
 #include "string"
 #include "FunctionUtils.h"
@@ -19,37 +15,6 @@ class PyObject1;
 class PyCompilerFlags1;
 constexpr auto Py_file_input1 = 257;
 
-
-class PythonApi{
-public:
-    static void setCameraAnchor(Vec3 anchor, bool imm);
-    static void setPickRange(float range);
-
-    static void setEnableGaussianBlur(bool value);
-    static void setGaussianBlurRadius(float radius);
-
-    static void HideNameTag(bool value);
-    static void ResetSkyColor();
-    static void setSkyColor(float r,float g,float b,float a);
-
-    static void setEnableVignette(bool value);
-    static void setVignetteCenter(float x,float y);
-    static void setVignetteRGB(float r,float g, float b);
-    static void setVignetteRadius(float radius);
-    static void setVignetteSmoothness(float radius);
-
-    static void setEnableColorAdjustment(bool value);
-    static void setColorAdjustmentBrightness(float brightness);
-    static void setColorAdjustmentContrast(float contrast);
-    static void setColorAdjustmentSaturation(float saturation);
-    static void setColorAdjustmentTint(float intensity, float r, float g, float b);
-    static void executeCommand(const std::string& cmd);
-    static void show_toast(std::string text);
-
-    static void setDeBug();
-    static float getFPS();
-    static void summonVehicle();
-};
 
 class PythonUtils{
 public:
@@ -243,10 +208,6 @@ static bool PyExecDirectChecked(const std::string& str) {
     return result != nullptr;
 }
 
-static void PyExec(std::string& str, bool noMessage = false) {
-    (void)PyExecChecked(str, noMessage);
-}
-
 static void setExecLocked(bool isLock = false) {
     const uintptr_t base_address = Main::getBaseAddress();
     const uintptr_t boolPtr = base_address + FunctionsAddress::PythonUtils_setExecLocked;
@@ -355,4 +316,4 @@ static void reportPythonError() {
 };
 
 
-#endif //OCEAN_PYTHONUTILS_H
+#endif //BUILD_TOOL_PYTHON_UTILS_H

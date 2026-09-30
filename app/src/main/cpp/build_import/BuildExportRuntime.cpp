@@ -10,7 +10,7 @@
 #include "SchematicWriter.h"
 #include "SignEntityCodec.h"
 #include "../main.h"
-#include "../tp/LightningEffect.h"
+#include "../tp/BuildPacketReceiveHook.h"
 #include "../tp/MinecraftUpdateHook.h"
 
 #include <algorithm>
@@ -534,7 +534,7 @@ bool BuildExportRuntime::start(BuildExportStartRequest request, std::string* err
     teleport_permission_unverified_ = false;
     // A new export must never inherit a failed/successful probe from an older
     // task.  Its first batch creates a fresh server TP verification.
-    CancelPendingTeleportRequest();
+    CancelBuildExportTeleport();
     teleport_hop_limit_ = 0;
     hop_target_valid_ = false;
     hop_target_final_ = false;
@@ -1014,7 +1014,7 @@ bool BuildExportRuntime::restoreSnapshotLocked(
     last_checkpoint_at_ = std::chrono::steady_clock::now();
     command_blocks_ = std::move(snapshot.command_blocks);
     if (!replayJournalLocked(snapshot.journal_entries, error)) return false;
-    if (!allow_teleport_) CancelPendingTeleportRequest();
+    if (!allow_teleport_) CancelBuildExportTeleport();
     return true;
 }
 
@@ -1080,7 +1080,7 @@ bool BuildExportRuntime::resume(const std::string& output_path,
     publication_committed_.store(false, std::memory_order_release);
     // The restored batch must not inherit a stale result from a task that was
     // cancelled before this resume call.
-    CancelPendingTeleportRequest();
+    CancelBuildExportTeleport();
     std::string restore_error;
     bool restored = false;
     try {
@@ -1302,14 +1302,14 @@ void BuildExportRuntime::onGameTick() {
         if (allow_teleport_ && batch.teleport_verification_pending) {
             if (!hop_target_valid_) {
                 if (!requestBatchTeleportLocked(batch)) return;
-            } else if (!RequestTeleport(hop_target_x_, hop_target_y_, hop_target_z_)) {
+            } else if (!RequestBuildExportTeleport(hop_target_x_, hop_target_y_, hop_target_z_)) {
                 // The active hop was rejected or never moved the player
                 // (for example a server that refuses long-distance TPs).
                 // Retry with a shorter hop before giving up on automatic
                 // teleport entirely.
                 if (!requestBatchTeleportLocked(batch)) return;
             }
-            if (IsTeleportPermissionProbePending()) {
+            if (IsBuildExportTeleportPending()) {
                 setStatus("Teleporting to region " + std::to_string(current_batch_ + 1) + "/" +
                           std::to_string(batches_.size()) + " and verifying player coordinates");
                 return;
@@ -1429,7 +1429,7 @@ void BuildExportRuntime::beginBatchLoadLocked(bool reset_progress) {
         hop_target_valid_ = false;
         if (!requestBatchTeleportLocked(batch)) return;
         batch.teleport_verification_pending =
-            !hop_target_final_ || IsTeleportPermissionProbePending();
+            !hop_target_final_ || IsBuildExportTeleportPending();
         state_.store(BuildExportState::LoadingRegion, std::memory_order_release);
         setStatus(batch.teleport_verification_pending
             ? "Teleporting to region " + std::to_string(current_batch_ + 1) + "/" +
@@ -1440,7 +1440,7 @@ void BuildExportRuntime::beginBatchLoadLocked(bool reset_progress) {
         // Manual mode starts in a visible waiting state even when a region
         // happens to be cached. This makes the required player position
         // explicit and prevents scanning chunks that may unload mid-pass.
-        CancelPendingTeleportRequest();
+        CancelBuildExportTeleport();
         batch.wait_ticks = 0;
         state_.store(BuildExportState::WaitingForPlayer, std::memory_order_release);
         setWaitingForPlayerStatusLocked();
@@ -1520,7 +1520,7 @@ void BuildExportRuntime::retryBatchLocked(const std::string& reason) {
         hop_target_valid_ = false;
         if (!requestBatchTeleportLocked(batch)) return;
         batch.teleport_verification_pending =
-            !hop_target_final_ || IsTeleportPermissionProbePending();
+            !hop_target_final_ || IsBuildExportTeleportPending();
         batch.wait_ticks = kRetryChunkWaitTicks;
         state_.store(BuildExportState::LoadingRegion, std::memory_order_release);
         setStatus("Retrying region " + std::to_string(current_batch_ + 1) + "/" +
@@ -1640,7 +1640,7 @@ bool BuildExportRuntime::requestBatchTeleportLocked(ScanBatch& batch) {
                 final_hop = false;
             }
         }
-        if (RequestTeleport(static_cast<float>(hop_x), target_y,
+        if (RequestBuildExportTeleport(static_cast<float>(hop_x), target_y,
                             static_cast<float>(hop_z))) {
             hop_target_valid_ = true;
             hop_target_final_ = final_hop;
@@ -1666,7 +1666,7 @@ void BuildExportRuntime::disableTeleportLocked(const std::string& reason) {
     travel_mode_ = BuildExportTravelMode::Disabled;
     teleport_permission_unverified_ = true;
     hop_target_valid_ = false;
-    CancelPendingTeleportRequest();
+    CancelBuildExportTeleport();
     if (current_batch_ >= batches_.size()) {
         setStatus("Automatic teleport disabled because server TP did not reach the target");
         return;
@@ -2364,7 +2364,7 @@ void BuildExportRuntime::retryContainerCaptureLocked(const std::string& reason) 
     container_id_ = 0;
     container_type_ = 0;
     if (container_phase_ == ContainerCapturePhase::WaitingForTeleport) {
-        CancelPendingTeleportRequest();
+        CancelBuildExportTeleport();
     }
     if (container_attempt_ >= kMaximumContainerAttempts) {
         const ContainerCaptureTarget& target =
@@ -2453,7 +2453,7 @@ void BuildExportRuntime::tickContainerCaptureLocked() {
             }
             const int32_t above_y = target.y == std::numeric_limits<int32_t>::max()
                 ? target.y : target.y + 1;
-            if (!RequestTeleport(static_cast<float>(target.x) + 0.5F,
+            if (!RequestBuildExportTeleport(static_cast<float>(target.x) + 0.5F,
                                  static_cast<float>(above_y),
                                  static_cast<float>(target.z) + 0.5F)) {
                 retryContainerCaptureLocked("server teleport request was rejected");
@@ -2470,7 +2470,7 @@ void BuildExportRuntime::tickContainerCaptureLocked() {
                 retryContainerCaptureLocked("teleport verification timed out");
                 return;
             }
-            if (IsTeleportPermissionProbePending()) return;
+            if (IsBuildExportTeleportPending()) return;
             if (!playerNearCurrentContainerLocked()) {
                 retryContainerCaptureLocked("player did not arrive within interaction range");
                 return;
@@ -2508,8 +2508,8 @@ void BuildExportRuntime::tickContainerCaptureLocked() {
             // Hook installation can run before libminecraftpe has finished
             // mapping. Retry it here on the game thread instead of spending
             // all container-face attempts waiting on a hook that never ran.
-            if (!LightningEffect::isReceiveHookReady() &&
-                !LightningEffect::init(Main::getBaseAddress())) {
+            if (!BuildPacketReceiveHook::isReceiveHookReady() &&
+                !BuildPacketReceiveHook::init(Main::getBaseAddress())) {
                 retryContainerCaptureLocked(
                     "container packet receive hook is unavailable");
                 return;
@@ -2912,7 +2912,7 @@ void BuildExportRuntime::failLocked(const std::string& reason) {
         !checkpoint_commit_in_progress_) {
         checkpoint_saved = commitCheckpointLocked(true, &checkpoint_error);
     }
-    CancelPendingTeleportRequest();
+    CancelBuildExportTeleport();
     state_.store(BuildExportState::Failed, std::memory_order_release);
     releaseScanMemoryLocked();
     if (!checkpoint_initialized_) {
@@ -2946,7 +2946,7 @@ void BuildExportRuntime::cancel() {
         checkpoint_saved = commitCheckpointLocked(true, &checkpoint_error);
     }
     generation_.fetch_add(1, std::memory_order_acq_rel);
-    CancelPendingTeleportRequest();
+    CancelBuildExportTeleport();
     state_.store(BuildExportState::Cancelled, std::memory_order_release);
     releaseScanMemoryLocked();
     if (!checkpoint_initialized_) {

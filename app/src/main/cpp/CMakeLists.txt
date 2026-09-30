@@ -144,11 +144,10 @@ add_library(
         build_import/BuildImportCheckpoint.cpp
         build_import/BuildImportUndoStore.cpp
         build_import/BuildImportController.cpp
-        tp/PythonUtils.cpp
         tp/TpModule.cpp
         tp/FunctionsAddress.cpp
         tp/MinecraftUpdateHook.cpp
-        tp/LightningEffect.cpp
+        tp/BuildPacketReceiveHook.cpp
         tp/LoopbackPacketSenderCapture.cpp
         ${SRC}
 )

@@ -69,7 +69,6 @@ object BuildImportUi {
     private const val VERIFICATION_PRECISION_FAST = 0
     private const val VERIFICATION_PRECISION_THOROUGH = 2
     private const val MAX_BLOCKS_PER_SECOND = 200_000
-    private const val LIMITED_MAX_BLOCKS_PER_SECOND = 500
     private const val MIN_SIMULATION_CHUNK_RANGE = 4
     private const val MAX_SIMULATION_CHUNK_RANGE = 8
     private const val DEFAULT_SIMULATION_CHUNK_RANGE = 4
@@ -219,17 +218,13 @@ object BuildImportUi {
         }
     }
 
-    /**
-     * Opens the import panel.  [limited] is presentation-only; native startup
-     * admission repeats the ticket, format, non-air-block, and rate checks so
-     * direct Java calls cannot bypass the restricted-import policy.
-     */
-    fun show(activity: Activity, context: Context, limited: Boolean = false) {
-        show(activity, context, limited, BuildImportSourceMode.STRUCTURE)
+    /** Opens the structure import panel. */
+    fun show(activity: Activity, context: Context) {
+        show(activity, context, BuildImportSourceMode.STRUCTURE)
     }
 
     internal fun showPixelArt(activity: Activity, context: Context) {
-        show(activity, context, limited = false, BuildImportSourceMode.PIXEL_ART)
+        show(activity, context, BuildImportSourceMode.PIXEL_ART)
     }
 
     private fun showResumedProgressOverlay(
@@ -253,7 +248,6 @@ object BuildImportUi {
     private fun show(
         activity: Activity,
         context: Context,
-        limited: Boolean,
         sourceMode: BuildImportSourceMode
     ) {
         if (activity.isFinishing || activity.isDestroyed) return
@@ -261,7 +255,7 @@ object BuildImportUi {
         val overlayEyebrow = if (pixelArtMode) "IMAGE IMPORT" else "BUILD IMPORT"
         val appContext = context.applicationContext
         val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val maxBlocksPerSecond = if (limited) LIMITED_MAX_BLOCKS_PER_SECOND else MAX_BLOCKS_PER_SECOND
+        val maxBlocksPerSecond = MAX_BLOCKS_PER_SECOND
         val nativeState = runCatching { TpModule.getBuildImportState() }.getOrNull()
         discardMissingLastSpool(appContext, nativeState)
         val density = context.resources.displayMetrics.density
@@ -446,7 +440,6 @@ object BuildImportUi {
         val sourceContainer = labeledInput(
             when {
                 pixelArtMode -> "选择 PNG/JPG 图片"
-                limited -> "选择 Schematic 建筑文件（仅 .schem / .schematic）"
                 else -> "选择建筑或 MIDI 文件（.mid / .midi）"
             }
         )
@@ -457,22 +450,11 @@ object BuildImportUi {
         fileRow.addView(sourceContainer, LinearLayout.LayoutParams(0, dp(49f), 1f))
         fileRow.addView(chooseFile, LinearLayout.LayoutParams(dp(92f), dp(35f)).apply { marginStart = dp(7f) })
         form.addView(fileRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(49f)))
-        if (!pixelArtMode && !limited) {
+        if (!pixelArtMode) {
             form.addView(TextView(activity).apply {
                 text = "支持建筑文件和 MIDI（.mid / .midi）；MIDI 会解析多轨/多通道、音色、力度和延音，并生成多声部命令方块音乐。"
                 textSize = 12f
                 setTextColor(Color.parseColor(UI_MUTED))
-                setPadding(dp(2f), dp(8f), dp(2f), 0)
-            }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ))
-        }
-        if (limited) {
-            form.addView(TextView(activity).apply {
-                text = "受限导入：仅支持 .schem / .schematic；解析后非空气方块不得超过 50,000，速度上限 500 方块/秒。"
-                textSize = 12f
-                setTextColor(Color.parseColor("#A87631"))
                 setPadding(dp(2f), dp(8f), dp(2f), 0)
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -538,19 +520,19 @@ object BuildImportUi {
             isChecked = false
             minHeight = dp(29f)
         }
-        if (!limited) optionsContainer.addView(clearExisting)
+        optionsContainer.addView(clearExisting)
         val placeDenyLayer = CheckBox(activity).apply {
             text = if (pixelArtMode) "在像素画底部放置拒绝方块" else "在建筑底部放置拒绝方块"
             textSize = 11f
             setTextColor(Color.parseColor(UI_INK))
             buttonTintList = ColorStateList.valueOf(Color.parseColor(UI_ACCENT))
-            isChecked = !limited && prefs.getBoolean(KEY_PLACE_DENY_LAYER, false)
+            isChecked = prefs.getBoolean(KEY_PLACE_DENY_LAYER, false)
             minHeight = dp(29f)
         }
         placeDenyLayer.setOnCheckedChangeListener { _, checked ->
-            if (!limited) prefs.edit().putBoolean(KEY_PLACE_DENY_LAYER, checked).apply()
+            prefs.edit().putBoolean(KEY_PLACE_DENY_LAYER, checked).apply()
         }
-        if (!limited) optionsContainer.addView(placeDenyLayer)
+        optionsContainer.addView(placeDenyLayer)
         val createMapsAfterImport = CheckBox(activity).apply {
             text = "导入完成后自动制作地图"
             textSize = 11f
@@ -573,10 +555,10 @@ object BuildImportUi {
             textSize = 11f
             setTextColor(Color.parseColor(UI_INK))
             buttonTintList = ColorStateList.valueOf(Color.parseColor(UI_ACCENT))
-            isChecked = !limited && prefs.getBoolean(KEY_VERIFY_AFTER_IMPORT, true)
+            isChecked = prefs.getBoolean(KEY_VERIFY_AFTER_IMPORT, true)
             minHeight = dp(29f)
         }
-        if (!limited) optionsContainer.addView(verifyAfterImport)
+        optionsContainer.addView(verifyAfterImport)
         val verificationPrecisionLabel = TextView(activity).apply {
             text = "校验精度 · 每区块最多抽样"
             textSize = 10f
@@ -622,22 +604,13 @@ object BuildImportUi {
                 }
             )
         }
-        if (!limited) {
-            optionsContainer.addView(verificationPrecisionLabel)
-            optionsContainer.addView(
-                verificationPrecisionRow,
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30f))
-            )
-        } else {
-            optionsContainer.addView(TextView(activity).apply {
-                text = "受限模式已强制关闭：覆盖已有方块、拒绝方块层、导入后校验与自动修复。"
-                textSize = 10f
-                setTextColor(Color.parseColor("#A87631"))
-                setPadding(dp(2f), dp(10f), dp(2f), dp(2f))
-            })
-        }
+        optionsContainer.addView(verificationPrecisionLabel)
+        optionsContainer.addView(
+            verificationPrecisionRow,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(30f))
+        )
         verifyAfterImport.setOnCheckedChangeListener { _, checked ->
-            if (!limited) prefs.edit().putBoolean(KEY_VERIFY_AFTER_IMPORT, checked).apply()
+            prefs.edit().putBoolean(KEY_VERIFY_AFTER_IMPORT, checked).apply()
             refreshVerificationPrecisionControls()
         }
         refreshVerificationPrecisionControls()
@@ -691,8 +664,7 @@ object BuildImportUi {
         val undo = action("撤销导入"); val cancel = action("取消")
         if (useTwoPane) {
             val row = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
-            val visibleActions = if (limited) listOf(start, pause, resume, restore, cancel)
-                else listOf(start, pause, resume, restore, undo, cancel)
+            val visibleActions = listOf(start, pause, resume, restore, undo, cancel)
             visibleActions.forEachIndexed { index, button ->
                 row.addView(button, LinearLayout.LayoutParams(0, dp(35f), if (button === start) 1.35f else 1f).apply {
                     if (index != visibleActions.lastIndex) marginEnd = dp(6f)
@@ -705,7 +677,7 @@ object BuildImportUi {
             topActions.addView(pause, LinearLayout.LayoutParams(0, dp(36f), 0.65f))
             fixedActions.addView(topActions)
             val bottomActions = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
-            val visibleActions = if (limited) listOf(resume, restore, cancel) else listOf(resume, restore, undo, cancel)
+            val visibleActions = listOf(resume, restore, undo, cancel)
             visibleActions.forEachIndexed { index, button ->
                 bottomActions.addView(button, LinearLayout.LayoutParams(0, dp(34f), 1f).apply {
                     if (index != visibleActions.lastIndex) marginEnd = dp(6f)
@@ -735,8 +707,7 @@ object BuildImportUi {
             resume.isEnabled = nativeState == 3 || nativeState == 4
             restore.isEnabled = (nativeState == 0 || nativeState == 5 || nativeState == 6) &&
                 hasRestorableArtifacts(readLastSpool(prefs))
-            undo.isEnabled = !limited &&
-                (nativeState == 0 || nativeState == 5 || nativeState == 6) &&
+            undo.isEnabled = (nativeState == 0 || nativeState == 5 || nativeState == 6) &&
                 hasUndoManifest(appContext)
             cancel.isEnabled = nativeState in 1..4 || nativeState == 7
         }
@@ -822,7 +793,7 @@ object BuildImportUi {
         }
 
         chooseFile.setOnClickListener {
-            showNeteaseFileList(activity, context, sourceMode, limited) {
+            showNeteaseFileList(activity, context, sourceMode) {
                 sourcePath.setText(it.absolutePath)
             }
         }
@@ -860,10 +831,9 @@ object BuildImportUi {
             }
             val sourceFile = File(source)
             if (!sourceFile.isFile || !sourceFile.canRead()) { Toast.makeText(context, "导入文件不可读取", Toast.LENGTH_SHORT).show(); return@setOnClickListener }
-            if (!BuildImportSourcePolicy.accepts(sourceFile.name, sourceMode, limited)) {
+            if (!BuildImportSourcePolicy.accepts(sourceFile.name, sourceMode)) {
                 val message = when {
                     pixelArtMode -> "图片导入仅支持 PNG、JPG 或 JPEG 图片"
-                    limited -> "受限导入仅支持 .schem 或 .schematic 文件"
                     else -> "建筑导入不支持该文件格式；MIDI 仅支持 .mid / .midi，PNG/JPG 请使用图片导入"
                 }
                 Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
@@ -1075,7 +1045,7 @@ object BuildImportUi {
             }.start()
         }
         undo.setOnClickListener {
-            if (limited || !hasUndoManifest(appContext)) {
+            if (!hasUndoManifest(appContext)) {
                 Toast.makeText(context, "没有可撤销的成功导入", Toast.LENGTH_SHORT).show()
                 updateActionState()
                 return@setOnClickListener
@@ -1340,12 +1310,11 @@ object BuildImportUi {
         activity: Activity,
         context: Context,
         sourceMode: BuildImportSourceMode,
-        limited: Boolean,
         onSelected: (File) -> Unit
     ) {
         val directory = context.getExternalFilesDir(null)?.let { File(it, "netease") }
         val files = directory?.listFiles()?.filter {
-            it.isFile && BuildImportSourcePolicy.accepts(it.name, sourceMode, limited)
+            it.isFile && BuildImportSourcePolicy.accepts(it.name, sourceMode)
         }?.sortedBy { it.name.lowercase(Locale.ROOT) }.orEmpty()
         if (files.isEmpty()) {
             Toast.makeText(
@@ -1368,7 +1337,6 @@ object BuildImportUi {
             if (sourceMode == BuildImportSourceMode.PIXEL_ART) "选择图片" else "选择建筑或 MIDI 文件",
             when {
                 sourceMode == BuildImportSourceMode.PIXEL_ART -> "来自 files/netease/ · PNG/JPG/JPEG"
-                limited -> "受限模式：仅 .schem / .schematic"
                 else -> "来自 files/netease/ · 建筑 / MIDI（.mid / .midi）"
             },
             listDialog::dismiss

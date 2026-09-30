@@ -13,9 +13,8 @@
 
 #include "main.h"
 #include "log_control.h"
-#include "native_auth.h"
 #include "tp/TpModule.h"
-#include "tp/LightningEffect.h"
+#include "tp/BuildPacketReceiveHook.h"
 #include "tp/MinecraftUpdateHook.h"
 #include "tp/LoopbackPacketSenderCapture.h"
 #include "build_import/BuildProjectionRenderer.h"
@@ -88,7 +87,7 @@ void initializeHooksIfReady() {
     if (!hooks_initialized.exchange(true)) {
         LOGI("Minecraft library ready; initializing building tool hooks");
     }
-    if (!LightningEffect::isReceiveHookReady() && !LightningEffect::init(base_address)) {
+    if (!BuildPacketReceiveHook::isReceiveHookReady() && !BuildPacketReceiveHook::init(base_address)) {
         LOGE("Command acknowledgement hook is not ready");
     }
     if (!InitMinecraftUpdateHook(base_address)) {
@@ -200,12 +199,6 @@ bool EnsureBuildProjectionHooksReady() {
            build_import::InitBuildProjectionHook(base_address);
 }
 
-// Compatibility for native building-tool call sites. Access is local and
-// never depends on an account, ticket, server, or expiry timer.
-bool IsBuildToolsAuthorized() { return true; }
-bool IsNativeSessionAuthorized() { return true; }
-bool IsNativeOperationAuthorized() { return true; }
-
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
@@ -223,7 +216,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         if (env->ExceptionCheck()) env->ExceptionClear();
         return JNI_ERR;
     }
-    TpModule::setJavaVM(vm);
     std::thread(waitForMinecraft).detach();
     return JNI_VERSION_1_6;
 }

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <initializer_list>
 #include <iterator>
 #include <memory>

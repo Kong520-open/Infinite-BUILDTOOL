@@ -65,18 +65,6 @@ enum class ImportSourceType : uint8_t {
     CommandMusicMidi,
 };
 
-// Full access is granted by a live signed capability ticket.  The limited
-// profile is deliberately narrow and is the only profile available before a
-// building-tools account has been verified.
-enum class BuildToolsAccessProfile : uint8_t {
-    Full = 0,
-    LimitedImport = 1,
-};
-
-inline bool isLimitedBuildToolsImport(BuildToolsAccessProfile profile) {
-    return profile == BuildToolsAccessProfile::LimitedImport;
-}
-
 constexpr size_t kImportPhaseCount = static_cast<size_t>(ImportPhase::Count);
 
 // Raw parser output is temporary, but keeping an explicit versioned layout
@@ -294,11 +282,8 @@ struct ImportConfig {
     // newly added tickingarea time to become usable before placement begins.
     int32_t chunk_wait_ticks = 60;
     int32_t blocks_per_second = 20;
-    // These fields are checkpointed.  In particular, a checkpoint created
-    // with full capability must never be silently resumed as an unverified
-    // limited import after the capability expires.
+    // Persist the source type for checkpoint restoration.
     ImportSourceType source_type = ImportSourceType::Schematic;
-    BuildToolsAccessProfile access_profile = BuildToolsAccessProfile::Full;
     int32_t ticking_area_min_y = 0;
     int32_t ticking_area_max_y = 255;
     int32_t teleport_y_offset = 50;

@@ -1,21 +1,17 @@
 #include "MinecraftUpdateHook.h"
 #include "../build_import/MapAnvilDebugBridge.h"
-#include "TpModule.h"
 #include "PythonUtils.h"
 #include "FunctionsAddress.h"
 #include "LoopbackPacketSenderCapture.h"
-#include "LightningEffect.h"
 #include "../build_import/BuildExportRuntime.h"
 #include "../build_import/BuildImportRuntime.h"
 #include "../build_import/ProjectionPrinterRuntime.h"
 #include "../build_import/ProjectionWorldMatchRuntime.h"
 #include "../build_import/PyRpcAckDecoder.h"
-#include "../native_auth.h"
 #include "../main.h"
 #include "../log_control.h"
 #include "dobby.h"
 #include <openssl/sha.h>
-#include <openssl/crypto.h>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -29,11 +25,6 @@
 #include <thread>
 
 #define LOG_TAG "Infinitecz_C_MinecraftUpdateHook"
-
-// Actor::teleportTo 函数签名
-// void Actor::teleportTo(Actor* this, Vec3 const& pos, bool a, int b, int c)
-// Vec3 通过引用传递（ARM64 下是通过指针）
-typedef void (*teleportTo_t)(void*, Vec3*, bool, int, int);
 
 // Actor::normalTick 原始函数指针
 using ActorNormalTickFunction = void (*)(void*);
@@ -128,20 +119,8 @@ void* GetLocalPlayerPointer() {
     return g_localPlayer.load(std::memory_order_acquire) == actor ? actor : nullptr;
 }
 
-// 待执行的 Python 代码
-static std::string g_pendingCode;
-static std::mutex g_codeMutex;
-
-// 状态标志
-static std::atomic<bool> g_hasPendingCode(false);
 static std::atomic<bool> g_hookInstalled(false);
 static std::atomic<bool> g_firstTick(true);
-
-// 时间控制
-static auto g_lastExecTime = std::chrono::steady_clock::now();
-static const int EXEC_INTERVAL_MS = 1000;
-
-// 执行结果
 
 static std::mutex g_worldContextMutex;
 static std::condition_variable g_worldContextCondition;
@@ -151,39 +130,27 @@ static std::string g_cachedWorldContext = "unknown";
 static uintptr_t g_cachedDimensionToken = 0;
 static std::thread::id g_gameThreadId;
 
-static std::mutex g_playerPermissionMutex;
-static std::condition_variable g_playerPermissionCondition;
-static uint64_t g_playerPermissionRequested = 0;
-static uint64_t g_playerPermissionCompleted = 0;
-static int g_cachedPlayerPermission = -1;
-static bool g_cachedPlayerPermissionValid = false;
-
-static std::mutex g_teleportPermissionProbeMutex;
-static std::condition_variable g_teleportPermissionProbeCondition;
-static uint64_t g_teleportPermissionProbeRequested = 0;
-static uint64_t g_teleportPermissionProbeCompleted = 0;
-static bool g_teleportPermissionProbeDispatching = false;
-static bool g_teleportPermissionProbeSent = false;
-static bool g_teleportPermissionProbeAccepted = false;
-static std::string g_teleportPermissionProbeUuid;
-static std::string g_teleportPermissionProbeDetail;
-static std::string g_teleportPermissionProbeUntaggedFailure;
-static uintptr_t g_teleportPermissionProbeDimensionToken = 0;
-static int64_t g_teleportPermissionProbeDeadlineNs = 0;
-static bool g_teleportPermissionProbePublishesTeleport = false;
-static Vec3 g_teleportPermissionProbeTarget = {0, 0, 0};
+static std::mutex g_buildExportTeleportMutex;
+static uint64_t g_buildExportTeleportRequested = 0;
+static uint64_t g_buildExportTeleportCompleted = 0;
+static bool g_buildExportTeleportDispatching = false;
+static bool g_buildExportTeleportSent = false;
+static bool g_buildExportTeleportAccepted = false;
+static std::string g_buildExportTeleportUuid;
+static std::string g_buildExportTeleportDetail;
+static std::string g_buildExportTeleportUntaggedFailure;
+static uintptr_t g_buildExportTeleportDimensionToken = 0;
+static int64_t g_buildExportTeleportDeadlineNs = 0;
+static bool g_buildExportTeleportActive = false;
+static Vec3 g_buildExportTeleportTarget = {0, 0, 0};
 // A build-export movement probe is deliberately confirmed from native actor
 // coordinates rather than from a PyRpc command acknowledgement.  Some servers
 // execute /tp correctly but do not return the acknowledgement shape expected
 // by the client hook.
-static int32_t g_teleportPermissionProbeOriginX = 0;
-static int32_t g_teleportPermissionProbeOriginY = 0;
-static int32_t g_teleportPermissionProbeOriginZ = 0;
-static bool g_teleportPermissionProbeOriginValid = false;
-static std::atomic<uint64_t> g_verifiedTeleportCredential{0};
-static std::atomic<uintptr_t> g_verifiedTeleportDimensionToken{0};
-static std::atomic<int64_t> g_verifiedTeleportAtNs{0};
-constexpr int64_t kTeleportPermissionValidityNs = 2LL * 60LL * 1000LL * 1000LL * 1000LL;
+static int32_t g_buildExportTeleportOriginX = 0;
+static int32_t g_buildExportTeleportOriginY = 0;
+static int32_t g_buildExportTeleportOriginZ = 0;
+static bool g_buildExportTeleportOriginValid = false;
 constexpr int32_t kTeleportArrivalHorizontalRadius = 3;
 constexpr int32_t kTeleportArrivalVerticalRadius = 16;
 
@@ -200,29 +167,23 @@ static bool isNearTeleportTarget(int32_t x, int32_t y, int32_t z,
                kTeleportArrivalVerticalRadius;
 }
 
-static void clearSensitiveString(std::string& value) {
-    if (!value.empty()) OPENSSL_cleanse(value.data(), value.size());
-    std::string empty;
-    value.swap(empty);
-}
-
-static void CompleteTeleportPermissionProbe(uint64_t request, bool accepted,
-                                            std::string detail) {
-    std::lock_guard<std::mutex> probe_lock(g_teleportPermissionProbeMutex);
-    if (request != g_teleportPermissionProbeRequested ||
-        request <= g_teleportPermissionProbeCompleted) {
+static void CompleteBuildExportTeleport(uint64_t request, bool accepted,
+                                       std::string detail) {
+    std::lock_guard<std::mutex> probe_lock(g_buildExportTeleportMutex);
+    if (request != g_buildExportTeleportRequested ||
+        request <= g_buildExportTeleportCompleted) {
         return;
     }
 
-    const uintptr_t expected_dimension = g_teleportPermissionProbeDimensionToken;
+    const uintptr_t expected_dimension = g_buildExportTeleportDimensionToken;
     const uintptr_t current_dimension =
         build_import::NativeWorldAccess::dimensionToken();
     const int64_t now = monotonicNowNs();
     if (accepted &&
-        (g_teleportPermissionProbeDeadlineNs <= 0 ||
-         now >= g_teleportPermissionProbeDeadlineNs)) {
+        (g_buildExportTeleportDeadlineNs <= 0 ||
+         now >= g_buildExportTeleportDeadlineNs)) {
         accepted = false;
-        detail = "TP command result arrived after the permission probe deadline";
+        detail = "Export teleport arrived after the movement deadline";
     }
     if (accepted &&
         (expected_dimension == 0 || current_dimension != expected_dimension)) {
@@ -230,31 +191,18 @@ static void CompleteTeleportPermissionProbe(uint64_t request, bool accepted,
         detail = "TP command result belongs to a session, world, or dimension that is no longer current";
     }
 
-    g_teleportPermissionProbeAccepted = accepted;
-    g_teleportPermissionProbeDispatching = false;
-    g_teleportPermissionProbeDetail = std::move(detail);
-    g_teleportPermissionProbeCompleted = request;
-    if (accepted) {
-        g_verifiedTeleportDimensionToken.store(current_dimension, std::memory_order_relaxed);
-        g_verifiedTeleportAtNs.store(now, std::memory_order_relaxed);
-        // For an export movement probe this release happens only after the
-        // local actor position has reached the server-requested centre.
-        g_verifiedTeleportCredential.store(request, std::memory_order_release);
-    } else {
-        g_verifiedTeleportCredential.store(0, std::memory_order_release);
-        g_verifiedTeleportDimensionToken.store(0, std::memory_order_relaxed);
-        g_verifiedTeleportAtNs.store(0, std::memory_order_relaxed);
-    }
-    g_teleportPermissionProbeCondition.notify_all();
+    g_buildExportTeleportAccepted = accepted;
+    g_buildExportTeleportDispatching = false;
+    g_buildExportTeleportDetail = std::move(detail);
+    g_buildExportTeleportCompleted = request;
 }
 
-static void ServiceTeleportPermissionProbe() {
+static void ServiceBuildExportTeleport() {
     uint64_t request = 0;
     std::string uuid;
     bool dimension_matches = false;
     bool timed_out = false;
     bool movement_probe_waiting_for_arrival = false;
-    bool publishes_teleport = false;
     Vec3 target = {0, 0, 0};
     int32_t origin_x = 0;
     int32_t origin_y = 0;
@@ -262,38 +210,36 @@ static void ServiceTeleportPermissionProbe() {
     bool origin_valid = false;
     std::string timeout_detail;
     {
-        std::lock_guard<std::mutex> lock(g_teleportPermissionProbeMutex);
-        if (g_teleportPermissionProbeCompleted >= g_teleportPermissionProbeRequested) return;
-        request = g_teleportPermissionProbeRequested;
-        uuid = g_teleportPermissionProbeUuid;
+        std::lock_guard<std::mutex> lock(g_buildExportTeleportMutex);
+        if (g_buildExportTeleportCompleted >= g_buildExportTeleportRequested) return;
+        request = g_buildExportTeleportRequested;
+        uuid = g_buildExportTeleportUuid;
         const int64_t now = monotonicNowNs();
-        if (g_teleportPermissionProbeDeadlineNs > 0 &&
-            now >= g_teleportPermissionProbeDeadlineNs) {
+        if (g_buildExportTeleportDeadlineNs > 0 &&
+            now >= g_buildExportTeleportDeadlineNs) {
             timed_out = true;
-            timeout_detail = g_teleportPermissionProbePublishesTeleport
-                ? "TP did not move the local player to the export region centre"
-                : (g_teleportPermissionProbeUntaggedFailure.empty()
-                    ? "TP permission probe timed out without a matching command result"
-                    : "TP command reported an untagged availability failure and no matching "
-                      "command result arrived: " + g_teleportPermissionProbeUntaggedFailure);
-        } else if (g_teleportPermissionProbePublishesTeleport &&
-                   g_teleportPermissionProbeSent) {
+            timeout_detail = "TP did not move the local player to the export region centre";
+            if (!g_buildExportTeleportUntaggedFailure.empty()) {
+                timeout_detail += ": " + g_buildExportTeleportUntaggedFailure;
+            }
+        } else if (g_buildExportTeleportActive &&
+                   g_buildExportTeleportSent) {
             movement_probe_waiting_for_arrival = true;
-            target = g_teleportPermissionProbeTarget;
-            origin_x = g_teleportPermissionProbeOriginX;
-            origin_y = g_teleportPermissionProbeOriginY;
-            origin_z = g_teleportPermissionProbeOriginZ;
-            origin_valid = g_teleportPermissionProbeOriginValid;
+            target = g_buildExportTeleportTarget;
+            origin_x = g_buildExportTeleportOriginX;
+            origin_y = g_buildExportTeleportOriginY;
+            origin_z = g_buildExportTeleportOriginZ;
+            origin_valid = g_buildExportTeleportOriginValid;
         } else {
-            if (g_teleportPermissionProbeDispatching || g_teleportPermissionProbeSent) return;
-            dimension_matches = g_teleportPermissionProbeDimensionToken != 0 &&
+            if (g_buildExportTeleportDispatching || g_buildExportTeleportSent) return;
+            dimension_matches = g_buildExportTeleportDimensionToken != 0 &&
                 build_import::NativeWorldAccess::dimensionToken() ==
-                    g_teleportPermissionProbeDimensionToken;
-            if (dimension_matches) g_teleportPermissionProbeDispatching = true;
+                    g_buildExportTeleportDimensionToken;
+            if (dimension_matches) g_buildExportTeleportDispatching = true;
         }
     }
     if (timed_out) {
-        CompleteTeleportPermissionProbe(request, false, std::move(timeout_detail));
+        CompleteBuildExportTeleport(request, false, std::move(timeout_detail));
         return;
     }
     if (movement_probe_waiting_for_arrival) {
@@ -310,7 +256,7 @@ static void ServiceTeleportPermissionProbe() {
             std::llabs(static_cast<int64_t>(player_y) - origin_y) > 1 ||
             std::llabs(static_cast<int64_t>(player_z) - origin_z) > 1;
         if (arrived && moved) {
-            CompleteTeleportPermissionProbe(
+            CompleteBuildExportTeleport(
                 request, true, "TP moved the local player to the export region centre");
             LOGI("teleport movement probe %llu reached (%d, %d, %d)",
                  static_cast<unsigned long long>(request), player_x, player_y, player_z);
@@ -318,21 +264,21 @@ static void ServiceTeleportPermissionProbe() {
         return;
     }
     if (!dimension_matches) {
-        CompleteTeleportPermissionProbe(
+        CompleteBuildExportTeleport(
             request, false, "World or dimension changed before sending the TP command");
         return;
     }
 
     {
-        std::lock_guard<std::mutex> lock(g_teleportPermissionProbeMutex);
-        publishes_teleport = request == g_teleportPermissionProbeRequested &&
-            g_teleportPermissionProbePublishesTeleport;
-        if (publishes_teleport) target = g_teleportPermissionProbeTarget;
+        std::lock_guard<std::mutex> lock(g_buildExportTeleportMutex);
+        if (request != g_buildExportTeleportRequested ||
+            request <= g_buildExportTeleportCompleted ||
+            !g_buildExportTeleportActive) return;
+        target = g_buildExportTeleportTarget;
     }
-    const std::string command = publishes_teleport
-        ? "/tp @s " + std::to_string(target.x) + " " + std::to_string(target.y) + " " +
-              std::to_string(target.z)
-        : "/tp @s ~ ~ ~";
+    const std::string command =
+        "/tp @s " + std::to_string(target.x) + " " + std::to_string(target.y) + " " +
+        std::to_string(target.z);
     std::string code =
         "import msgpack, _pynetmodule\n"
         "import mod.client.extraClientApi as _infinitecz_tp_api\n"
@@ -351,25 +297,25 @@ static void ServiceTeleportPermissionProbe() {
     const bool sent = PythonUtils::PyExecChecked(code, true);
     bool request_still_pending = false;
     {
-        std::lock_guard<std::mutex> lock(g_teleportPermissionProbeMutex);
-        request_still_pending = request == g_teleportPermissionProbeRequested &&
-            request > g_teleportPermissionProbeCompleted;
+        std::lock_guard<std::mutex> lock(g_buildExportTeleportMutex);
+        request_still_pending = request == g_buildExportTeleportRequested &&
+            request > g_buildExportTeleportCompleted;
         if (request_still_pending) {
-            g_teleportPermissionProbeDispatching = false;
+            g_buildExportTeleportDispatching = false;
             // AvailableCheckFailed has no UUID. It may only be attributed to
             // this command after the Python send itself completed successfully.
-            g_teleportPermissionProbeSent = sent;
+            g_buildExportTeleportSent = sent;
         }
     }
     if (!request_still_pending) return;
     if (!sent) {
-        LOGE("teleport permission probe %llu could not send the TP command",
+        LOGE("build export teleport %llu could not send the TP command",
              static_cast<unsigned long long>(request));
-        CompleteTeleportPermissionProbe(
-            request, false, "Unable to send the TP permission probe command");
+        CompleteBuildExportTeleport(
+            request, false, "Unable to send the export TP command");
         return;
     }
-    LOGI("teleport permission probe %llu sent uuid=%s command=%s",
+    LOGI("build export teleport %llu sent uuid=%s command=%s",
          static_cast<unsigned long long>(request), uuid.c_str(), command.c_str());
 }
 
@@ -547,205 +493,9 @@ static void ServiceWorldContextRequest() {
     g_worldContextCondition.notify_all();
 }
 
-static void ServicePlayerPermissionRequest() {
-    // clientlevel permission state is not reliable until the local player has
-    // been constructed. Keep the request pending so the first local-player
-    // tick, rather than an arbitrary NPC/remote actor tick, performs the read.
-    if (!g_localPlayer.load(std::memory_order_acquire)) return;
-    uint64_t request = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_playerPermissionMutex);
-        if (g_playerPermissionCompleted >= g_playerPermissionRequested) return;
-        request = g_playerPermissionRequested;
-    }
-
-    std::string value;
-    const bool evaluated = PythonUtils::PyEvalUtf8(
-        "import clientlevel\n"
-        "_infinitecz_player_permission = clientlevel.get_player_permissions()\n"
-        "import operator\n"
-        "try:\n"
-        "  _infinitecz_permission_string_types = (basestring,)\n"
-        "except NameError:\n"
-        "  _infinitecz_permission_string_types = (str,)\n"
-        "def _infinitecz_permission_true(value):\n"
-        "  try:\n"
-        "    if value is True: return True\n"
-        "    try:\n"
-        "      return type(value) in (int, long) and value == 1\n"
-        "    except NameError:\n"
-        "      return type(value) is int and value == 1\n"
-        "  except BaseException:\n"
-        "    return False\n"
-        "def _infinitecz_permission_text(value):\n"
-        "  try:\n"
-        "    if not isinstance(value, _infinitecz_permission_string_types): return None\n"
-        "    if value == '0': return 0\n"
-        "    if value == '1': return 1\n"
-        "    if value == '2': return 2\n"
-        "    if value == '3': return 3\n"
-        "    if value in ('Owner', 'OWNER', 'Operator', 'OPERATOR'): return 2\n"
-        "  except BaseException:\n"
-        "    pass\n"
-        "  return None\n"
-        "def _infinitecz_permission_index(value):\n"
-        "  try:\n"
-        "    if isinstance(value, bool): return None\n"
-        "    _text_value = _infinitecz_permission_text(value)\n"
-        "    if _text_value is not None: return _text_value\n"
-        "    _index_value = operator.index(value)\n"
-        "    if isinstance(_index_value, bool): return None\n"
-        "    if _index_value < 0 or _index_value > 3: return None\n"
-        "    return _index_value\n"
-        "  except BaseException:\n"
-        "    return None\n"
-        "def _infinitecz_permission_mapping(value):\n"
-        "  try:\n"
-        "    _keys = ('level', 'permission', 'permission_level', 'player_permission',\n"
-        "             'player_permission_level', 'value')\n"
-        "    _values = []\n"
-        "    for _key in _keys:\n"
-        "      if _key in value:\n"
-        "        _candidate = _infinitecz_permission_index(value[_key])\n"
-        "        if _candidate is None: return None\n"
-        "        _values.append(_candidate)\n"
-        "    if _values and len(set(_values)) == 1: return _values[0]\n"
-        "  except BaseException:\n"
-        "    pass\n"
-        "  return None\n"
-        "def _infinitecz_permission_normalize(value):\n"
-        "  _candidate = _infinitecz_permission_index(value)\n"
-        "  if _candidate is not None: return _candidate\n"
-        "  try:\n"
-        "    if isinstance(value, dict):\n"
-        "      _candidate = _infinitecz_permission_mapping(value)\n"
-        "      if _candidate is not None: return _candidate\n"
-        "    if isinstance(value, (tuple, list)) and len(value) == 1:\n"
-        "      _candidate = _infinitecz_permission_index(value[0])\n"
-        "      if _candidate is not None: return _candidate\n"
-        "    _values = []\n"
-        "    for _name in ('value', 'level', 'permission', 'permission_level',\n"
-        "                   'player_permission', 'player_permission_level'):\n"
-        "      try:\n"
-        "        if hasattr(value, _name):\n"
-        "          _candidate = _infinitecz_permission_index(getattr(value, _name))\n"
-        "          if _candidate is not None: _values.append(_candidate)\n"
-        "      except BaseException:\n"
-        "        pass\n"
-        "    if _values and len(set(_values)) == 1: return _values[0]\n"
-        "  except BaseException:\n"
-        "    pass\n"
-        "  return None\n"
-        "_infinitecz_player_permission_normalized = _infinitecz_permission_normalize("
-            "_infinitecz_player_permission)\n"
-        "_infinitecz_player_permission_owner = False\n"
-        "_infinitecz_player_permission_cheats = False\n"
-        "try:\n"
-        "  _infinitecz_player_permission_owner = _infinitecz_permission_true(\n"
-        "      clientlevel.is_local_player_owner())\n"
-        "except BaseException:\n"
-        "  pass\n"
-        "try:\n"
-        "  _infinitecz_player_permission_cheats = _infinitecz_permission_true(\n"
-        "      clientlevel.get_allow_cheats())\n"
-        "except BaseException:\n"
-        "  pass\n"
-        "_infinitecz_player_permission_source = 'direct'\n"
-        "if (_infinitecz_player_permission_normalized is None and\n"
-        "    _infinitecz_player_permission_owner and _infinitecz_player_permission_cheats):\n"
-        "  _infinitecz_player_permission_normalized = 2\n"
-        "  _infinitecz_player_permission_source = 'owner+cheats'\n"
-        "try:\n"
-        "  _infinitecz_player_permission_type = (\n"
-        "      type(_infinitecz_player_permission).__module__ + '.' +\n"
-        "      type(_infinitecz_player_permission).__name__)\n"
-        "except BaseException:\n"
-        "  _infinitecz_player_permission_type = 'unknown'\n"
-        "try:\n"
-        "  _infinitecz_player_permission_repr = repr(_infinitecz_player_permission)\n"
-        "  try:\n"
-        "    if isinstance(_infinitecz_player_permission_repr, unicode):\n"
-        "      _infinitecz_player_permission_repr = _infinitecz_player_permission_repr.encode(\n"
-        "          'utf-8', 'replace')\n"
-        "  except NameError:\n"
-        "    pass\n"
-        "  _infinitecz_player_permission_repr = str(_infinitecz_player_permission_repr)\n"
-        "  _infinitecz_player_permission_repr = _infinitecz_player_permission_repr.replace(\n"
-        "      '\\t', ' ').replace('\\r', ' ').replace('\\n', ' ')[:160]\n"
-        "except BaseException:\n"
-        "  _infinitecz_player_permission_repr = '<repr unavailable>'\n",
-        "('%s\\t%s\\t%s\\t%s\\t%s\\t%s' % (\n"
-        "  'invalid' if _infinitecz_player_permission_normalized is None else\n"
-        "      str(_infinitecz_player_permission_normalized),\n"
-        "  _infinitecz_player_permission_type, _infinitecz_player_permission_repr,\n"
-        "  '1' if _infinitecz_player_permission_owner else '0',\n"
-        "  '1' if _infinitecz_player_permission_cheats else '0',\n"
-        "  _infinitecz_player_permission_source))",
-        &value);
-
-    int permission = -1;
-    bool valid = false;
-    std::string normalized = value;
-    const size_t first_tab = value.find('\t');
-    if (first_tab != std::string::npos) normalized.resize(first_tab);
-    if (evaluated && normalized.size() == 1 && normalized[0] >= '0' &&
-        normalized[0] <= '3') {
-        permission = normalized[0] - '0';
-        valid = true;
-    }
-    const auto diagnosticField = [&value](size_t field_index) {
-        size_t begin = 0;
-        for (size_t index = 0; index < field_index; ++index) {
-            const size_t separator = value.find('\t', begin);
-            if (separator == std::string::npos) return std::string();
-            begin = separator + 1;
-        }
-        const size_t end = value.find('\t', begin);
-        return value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-    };
-    const std::string raw_type = diagnosticField(1);
-    const std::string raw_repr = diagnosticField(2);
-    const std::string owner_flag = diagnosticField(3);
-    const std::string cheats_flag = diagnosticField(4);
-    const std::string normalization_source = diagnosticField(5);
-    {
-        std::lock_guard<std::mutex> lock(g_playerPermissionMutex);
-        // Revocation may invalidate and complete outstanding requests while
-        // this game-thread query is evaluating. Never let an older result
-        // overwrite that fail-closed completion.
-        if (request > g_playerPermissionCompleted) {
-            g_cachedPlayerPermission = permission;
-            g_cachedPlayerPermissionValid = valid;
-            g_playerPermissionCompleted = request;
-        }
-    }
-    g_playerPermissionCondition.notify_all();
-    if (valid) {
-        LOGI("player-permission request %llu completed with level %d source=%s "
-             "raw_type=%s raw_repr=%s owner=%s cheats=%s",
-             static_cast<unsigned long long>(request), permission,
-             normalization_source.empty() ? "unknown" : normalization_source.c_str(),
-             raw_type.empty() ? "unknown" : raw_type.c_str(),
-             raw_repr.empty() ? "unknown" : raw_repr.c_str(),
-             owner_flag == "1" ? "true" : "false",
-             cheats_flag == "1" ? "true" : "false");
-    } else {
-        LOGE("player-permission request %llu failed: evaluated=%s normalized=%s "
-             "raw_type=%s raw_repr=%s owner=%s cheats=%s",
-             static_cast<unsigned long long>(request), evaluated ? "true" : "false",
-             normalized.empty() ? "invalid" : normalized.c_str(),
-             raw_type.empty() ? "unknown" : raw_type.c_str(),
-             raw_repr.empty() ? "unknown" : raw_repr.c_str(),
-             owner_flag == "1" ? "true" : "false",
-             cheats_flag == "1" ? "true" : "false");
-    }
-}
-
-// Actor::normalTick hook 函数
 static void Actor_normalTick_Hook(void* actor) {
-    // Match the reference ActorTick lifecycle: record the actor marked with a
-    // GameMode before its original tick, then only run player modules for the
-    // remembered local-player instance afterwards.
+    // Record the verified local player before its original tick, then drive
+    // building operations only for that same actor after the tick.
     if (isLocalPlayerCandidate(actor)) {
         g_localPlayer.store(actor, std::memory_order_release);
         g_localPlayerLastTickNs.store(monotonicNowNs(), std::memory_order_release);
@@ -772,16 +522,10 @@ static void Actor_normalTick_Hook(void* actor) {
     // Build export verifies TP from a real command to the active region centre
     // and the observed local-player coordinate. Sending is done on this tick
     // and the coordinate check never stalls the game thread.
-    ServiceTeleportPermissionProbe();
-
-    // Unlike world identity, permission state can be invalid before the local
-    // player exists. Service it only on the confirmed local-player tick so an
-    // early remote-actor tick cannot complete the request with a false denial.
-    ServicePlayerPermissionRequest();
+    ServiceBuildExportTeleport();
 
     if (g_firstTick.exchange(false)) {
         LOGI("★ Actor::normalTick hook 已激活！");
-        g_lastExecTime = std::chrono::steady_clock::now();
     }
 
     build_import::TickMapAnvilDebugBridge();
@@ -861,30 +605,6 @@ static void Actor_normalTick_Hook(void* actor) {
         }
     }
 
-    // 检查是否有待执行的 Python 代码
-    if (!g_hasPendingCode.load()) return;
-
-    // 限频
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastExecTime).count();
-    if (elapsed < EXEC_INTERVAL_MS) return;
-    g_lastExecTime = now;
-
-    std::string code;
-    {
-        std::lock_guard<std::mutex> lock(g_codeMutex);
-        if (!g_hasPendingCode.load(std::memory_order_acquire)) return;
-        code.swap(g_pendingCode);
-        g_hasPendingCode.store(false, std::memory_order_release);
-    }
-
-    if (code.empty()) return;
-
-    LOGI("★ 从 Actor::normalTick 执行 Python 代码 (%zu bytes)", code.size());
-    PythonUtils::PyExec(code, true);
-    LOGI("★ Python 代码执行完成");
-
-    clearSensitiveString(code);
 }
 
 // 初始化 hook
@@ -921,217 +641,50 @@ bool InitMinecraftUpdateHook(uintptr_t baseAddr) {
     }
 }
 
-bool ProbeTeleportPermissionOnGameThread(std::string* detail, int timeout_ms) {
-    if (detail) detail->clear();
-    const bool session_authorized = IsNativeSessionAuthorized();
-    const bool hook_installed = g_hookInstalled.load(std::memory_order_acquire);
-    const uintptr_t base_address = Main::getBaseAddress();
-    const bool feedback_hook_ready = session_authorized && base_address != 0 &&
-        LightningEffect::init(base_address);
-    if (!session_authorized || timeout_ms <= 0 || !hook_installed ||
-        !feedback_hook_ready) {
-        if (detail) {
-            *detail = !session_authorized
-                ? "Native session is unavailable"
-                : (!hook_installed ? "Local-player tick hook is unavailable"
-                   : (!feedback_hook_ready ? "Command-result receive hook is unavailable"
-                                           : "Invalid TP probe timeout"));
-        }
-        return false;
-    }
-
-    std::thread::id game_thread_id;
-    {
-        std::lock_guard<std::mutex> lock(g_worldContextMutex);
-        game_thread_id = g_gameThreadId;
-    }
-    // A command ACK cannot arrive while its receive/game thread is blocked in
-    // this function. The export UI always calls from its worker thread.
-    if (game_thread_id == std::this_thread::get_id()) {
-        if (detail) *detail = "TP permission probe cannot wait on the game thread";
-        return false;
-    }
-
-    const uintptr_t request_dimension =
-        build_import::NativeWorldAccess::dimensionToken();
-    if (request_dimension == 0) {
-        if (detail) *detail = "Local player or dimension is unavailable";
-        return false;
-    }
-    CancelPendingTeleportRequest();
-
-    std::unique_lock<std::mutex> lock(g_teleportPermissionProbeMutex);
-    if (g_teleportPermissionProbeCompleted < g_teleportPermissionProbeRequested) {
-        if (detail) *detail = "Another TP permission probe is already running";
-        return false;
-    }
-
-    const uint64_t request = ++g_teleportPermissionProbeRequested;
-    const uint64_t clock_value = static_cast<uint64_t>(monotonicNowNs());
-    g_teleportPermissionProbeUuid =
-        std::string(build_import::kBuildExportTeleportProbeUuidPrefix) +
-        std::to_string(clock_value) + "_" + std::to_string(request);
-    g_teleportPermissionProbeDispatching = false;
-    g_teleportPermissionProbeSent = false;
-    g_teleportPermissionProbeAccepted = false;
-    g_teleportPermissionProbeDetail = "Waiting for the TP command result";
-    g_teleportPermissionProbeUntaggedFailure.clear();
-    g_teleportPermissionProbeDimensionToken = request_dimension;
-    g_teleportPermissionProbeDeadlineNs = monotonicNowNs() +
-        static_cast<int64_t>(timeout_ms) * 1000LL * 1000LL;
-    g_teleportPermissionProbePublishesTeleport = false;
-    g_teleportPermissionProbeTarget = {0, 0, 0};
-    g_teleportPermissionProbeOriginValid = false;
-    g_verifiedTeleportCredential.store(0, std::memory_order_release);
-    g_verifiedTeleportDimensionToken.store(0, std::memory_order_release);
-    g_verifiedTeleportAtNs.store(0, std::memory_order_release);
-
-    const bool completed = g_teleportPermissionProbeCondition.wait_for(
-        lock, std::chrono::milliseconds(timeout_ms), [&]() {
-            return g_teleportPermissionProbeCompleted >= request;
-        });
-    if (!completed) {
-        if (request == g_teleportPermissionProbeRequested &&
-            request > g_teleportPermissionProbeCompleted) {
-            g_teleportPermissionProbeAccepted = false;
-            g_teleportPermissionProbeDispatching = false;
-            g_teleportPermissionProbeSent = false;
-            g_teleportPermissionProbeDetail =
-                g_teleportPermissionProbeUntaggedFailure.empty()
-                    ? "TP permission probe timed out without a matching command result"
-                    : "TP command reported an untagged availability failure and no matching "
-                      "command result arrived: " +
-                      g_teleportPermissionProbeUntaggedFailure;
-            g_teleportPermissionProbeCompleted = request;
-            g_verifiedTeleportCredential.store(0, std::memory_order_release);
-            g_verifiedTeleportDimensionToken.store(0, std::memory_order_release);
-            g_verifiedTeleportAtNs.store(0, std::memory_order_release);
-        }
-        LOGE("teleport permission probe %llu timed out after %d ms",
-             static_cast<unsigned long long>(request), timeout_ms);
-    }
-    const bool accepted = request == g_teleportPermissionProbeRequested &&
-        g_teleportPermissionProbeCompleted >= request &&
-        g_teleportPermissionProbeAccepted;
-    const std::string result_detail = g_teleportPermissionProbeDetail;
-    lock.unlock();
-    if (detail) *detail = result_detail;
-    return accepted;
-}
-
-bool ObserveTeleportPermissionProbePacket(const std::string& packet) {
+bool ObserveBuildExportTeleportPacket(const std::string& packet) {
     build_import::PyRpcAckEvent event;
     if (!build_import::decodePyRpcAckPacket(packet, &event)) return false;
 
-    uint64_t request = 0;
-    bool uuid_result_pending = false;
-    bool untagged_failure_pending = false;
-    {
-        std::lock_guard<std::mutex> lock(g_teleportPermissionProbeMutex);
-        uuid_result_pending =
-            (g_teleportPermissionProbeDispatching || g_teleportPermissionProbeSent) &&
-            g_teleportPermissionProbeCompleted < g_teleportPermissionProbeRequested;
-        untagged_failure_pending = g_teleportPermissionProbeSent &&
-            g_teleportPermissionProbeCompleted < g_teleportPermissionProbeRequested;
-        request = g_teleportPermissionProbeRequested;
-        if (event.kind == build_import::PyRpcAckEventKind::AfterExecuteCommand ||
-            event.kind == build_import::PyRpcAckEventKind::ExecuteCommandOutput) {
-            if (!build_import::isBuildExportTeleportProbeUuid(event.uuid) ||
-                event.uuid != g_teleportPermissionProbeUuid) {
-                return false;
-            }
-            if (event.kind == build_import::PyRpcAckEventKind::ExecuteCommandOutput) {
-                return true;
-            }
-            if (!uuid_result_pending) return true;
-            // The build-export probe intentionally trusts only an observed
-            // position change.  Do not let a server-specific ACK shape turn a
-            // successful or failed movement into a false decision.
-            if (g_teleportPermissionProbePublishesTeleport) return true;
-        } else if (event.kind == build_import::PyRpcAckEventKind::AvailableCheckFailed) {
-            if (!untagged_failure_pending) return false;
-            // This event has no UUID, so it cannot by itself prove which
-            // command failed. Keep it only as timeout diagnostics; a matching
-            // AfterExecuteCommandEvent remains authoritative.
-            g_teleportPermissionProbeUntaggedFailure = event.reason.empty()
-                ? "availability check failed without a reason" : event.reason;
-            return false;
-        } else {
-            return false;
-        }
+    std::lock_guard<std::mutex> lock(g_buildExportTeleportMutex);
+    if (event.kind == build_import::PyRpcAckEventKind::AfterExecuteCommand ||
+        event.kind == build_import::PyRpcAckEventKind::ExecuteCommandOutput) {
+        // Only hide feedback belonging to our own export movement request.
+        // Arrival is verified from player coordinates, never from an ACK.
+        return build_import::isBuildExportTeleportProbeUuid(event.uuid) &&
+            event.uuid == g_buildExportTeleportUuid;
     }
-
-    if (event.kind == build_import::PyRpcAckEventKind::AfterExecuteCommand) {
-        const bool accepted = event.execute_result;
-        CompleteTeleportPermissionProbe(
-            request, accepted,
-            accepted ? "TP command succeeded; operator permission verified"
-                     : "TP command was rejected; operator permission is unavailable");
-        LOGI("teleport permission probe %llu completed accepted=%d uuid=%s",
-             static_cast<unsigned long long>(request), accepted ? 1 : 0,
-             event.uuid.c_str());
-        return true;
+    if (event.kind == build_import::PyRpcAckEventKind::AvailableCheckFailed &&
+        g_buildExportTeleportSent &&
+        g_buildExportTeleportCompleted < g_buildExportTeleportRequested) {
+        // This event has no UUID. Preserve it in the game UI and use it only
+        // as extra timeout diagnostics for the pending export movement.
+        g_buildExportTeleportUntaggedFailure = event.reason.empty()
+            ? "availability check failed without a reason" : event.reason;
     }
-
     return false;
 }
 
-bool HasVerifiedTeleportCommandPermission() {
-    if (!IsNativeSessionAuthorized()) {
-        InvalidateTeleportCommandPermission();
-        return false;
+void CancelBuildExportTeleport() {
+    std::lock_guard<std::mutex> lock(g_buildExportTeleportMutex);
+    if (g_buildExportTeleportCompleted < g_buildExportTeleportRequested) {
+        g_buildExportTeleportAccepted = false;
+        g_buildExportTeleportCompleted = g_buildExportTeleportRequested;
     }
-    const uint64_t credential =
-        g_verifiedTeleportCredential.load(std::memory_order_acquire);
-    if (credential == 0) return false;
-    const uintptr_t verified =
-        g_verifiedTeleportDimensionToken.load(std::memory_order_relaxed);
-    const int64_t verified_at = g_verifiedTeleportAtNs.load(std::memory_order_relaxed);
-    const int64_t now = monotonicNowNs();
-    const bool current = verified != 0 && verified_at > 0 && now >= verified_at &&
-        now - verified_at <= kTeleportPermissionValidityNs &&
-        build_import::NativeWorldAccess::dimensionToken() == verified;
-    if (!current) InvalidateTeleportCommandPermission();
-    return current;
-}
-
-void InvalidateTeleportCommandPermission() noexcept {
-    {
-        std::lock_guard<std::mutex> lock(g_teleportPermissionProbeMutex);
-        g_verifiedTeleportCredential.store(0, std::memory_order_release);
-        g_verifiedTeleportDimensionToken.store(0, std::memory_order_relaxed);
-        g_verifiedTeleportAtNs.store(0, std::memory_order_relaxed);
-        if (g_teleportPermissionProbeCompleted < g_teleportPermissionProbeRequested) {
-            g_teleportPermissionProbeAccepted = false;
-            g_teleportPermissionProbeCompleted = g_teleportPermissionProbeRequested;
-        }
-        g_teleportPermissionProbeDispatching = false;
-        g_teleportPermissionProbeSent = false;
-        g_teleportPermissionProbeDetail.clear();
-        g_teleportPermissionProbeUntaggedFailure.clear();
-        g_teleportPermissionProbeDimensionToken = 0;
-        g_teleportPermissionProbeDeadlineNs = 0;
-        g_teleportPermissionProbePublishesTeleport = false;
-        g_teleportPermissionProbeOriginValid = false;
-    }
-    g_teleportPermissionProbeCondition.notify_all();
-}
-
-// 提交 Python 代码
-void SubmitPythonCode(const std::string& code) {
-    if (!IsNativeOperationAuthorized()) return;
-    std::lock_guard<std::mutex> lock(g_codeMutex);
-    clearSensitiveString(g_pendingCode);
-    g_pendingCode = code;
-    g_hasPendingCode.store(true, std::memory_order_release);
-    LOGI("★ Python 代码已提交 (%zu bytes)", code.size());
+    g_buildExportTeleportDispatching = false;
+    g_buildExportTeleportSent = false;
+    g_buildExportTeleportDetail.clear();
+    g_buildExportTeleportUntaggedFailure.clear();
+    g_buildExportTeleportDimensionToken = 0;
+    g_buildExportTeleportDeadlineNs = 0;
+    g_buildExportTeleportActive = false;
+    g_buildExportTeleportOriginValid = false;
 }
 
 // Requests a real server TP and confirms it from the local actor's position.
 // This runs on Actor::normalTick, so NativeWorldAccess is allowed to read the
 // actor coordinate directly.  No native Actor::teleportTo is published here:
 // doing so would make a denied server command look successful.
-bool RequestTeleport(float x, float y, float z) {
+bool RequestBuildExportTeleport(float x, float y, float z) {
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
         return false;
     }
@@ -1147,29 +700,29 @@ bool RequestTeleport(float x, float y, float z) {
     }
     const Vec3 target = {x, y, z};
 
-    std::lock_guard<std::mutex> probe_lock(g_teleportPermissionProbeMutex);
+    std::lock_guard<std::mutex> probe_lock(g_buildExportTeleportMutex);
     if (build_import::NativeWorldAccess::dimensionToken() != request_dimension) {
         return false;
     }
 
     const bool probe_pending =
-        g_teleportPermissionProbeCompleted < g_teleportPermissionProbeRequested;
+        g_buildExportTeleportCompleted < g_buildExportTeleportRequested;
     const bool same_target =
-        g_teleportPermissionProbeTarget.x == x &&
-        g_teleportPermissionProbeTarget.y == y &&
-        g_teleportPermissionProbeTarget.z == z;
+        g_buildExportTeleportTarget.x == x &&
+        g_buildExportTeleportTarget.y == y &&
+        g_buildExportTeleportTarget.z == z;
     if (probe_pending) {
-        if (g_teleportPermissionProbePublishesTeleport &&
-            g_teleportPermissionProbeDimensionToken == request_dimension && same_target) {
+        if (g_buildExportTeleportActive &&
+            g_buildExportTeleportDimensionToken == request_dimension && same_target) {
             return true;
         }
         // Supersede a stale probe.  The previous server command cannot be
         // recalled, but its coordinate arrival is no longer accepted for this
         // batch and the next tick will send the new command.
-        ++g_teleportPermissionProbeRequested;
-        g_teleportPermissionProbeCompleted = g_teleportPermissionProbeRequested;
-        g_teleportPermissionProbePublishesTeleport = false;
-        g_teleportPermissionProbeAccepted = true;
+        ++g_buildExportTeleportRequested;
+        g_buildExportTeleportCompleted = g_buildExportTeleportRequested;
+        g_buildExportTeleportActive = false;
+        g_buildExportTeleportAccepted = true;
     }
 
     // Being already inside the target arrival window needs no server command
@@ -1182,51 +735,42 @@ bool RequestTeleport(float x, float y, float z) {
     // caller can observe the failure. A different target (for example a
     // shorter hop toward the same region on servers that refuse long-distance
     // TPs) starts a fresh probe that must again prove real player movement.
-    if (g_teleportPermissionProbePublishesTeleport &&
-        !g_teleportPermissionProbeAccepted && same_target) {
+    if (g_buildExportTeleportActive &&
+        !g_buildExportTeleportAccepted && same_target) {
         LOGE("teleport request rejected: the preceding coordinate verification failed (%s)",
-             g_teleportPermissionProbeDetail.empty()
+             g_buildExportTeleportDetail.empty()
                  ? "local player did not reach the target"
-                 : g_teleportPermissionProbeDetail.c_str());
+                 : g_buildExportTeleportDetail.c_str());
         return false;
     }
 
-    const uint64_t request = ++g_teleportPermissionProbeRequested;
+    const uint64_t request = ++g_buildExportTeleportRequested;
     const int64_t now = monotonicNowNs();
-    g_teleportPermissionProbeUuid =
+    g_buildExportTeleportUuid =
         std::string(build_import::kBuildExportTeleportProbeUuidPrefix) +
         std::to_string(static_cast<uint64_t>(now)) + "_" + std::to_string(request);
-    g_teleportPermissionProbeDispatching = false;
-    g_teleportPermissionProbeSent = false;
-    g_teleportPermissionProbeAccepted = false;
-    g_teleportPermissionProbeDetail = "Sending TP to the export region centre";
-    g_teleportPermissionProbeUntaggedFailure.clear();
-    g_teleportPermissionProbeDimensionToken = request_dimension;
-    g_teleportPermissionProbeDeadlineNs = now + 6LL * 1000LL * 1000LL * 1000LL;
-    g_teleportPermissionProbePublishesTeleport = true;
-    g_teleportPermissionProbeTarget = target;
-    g_teleportPermissionProbeOriginX = player_x;
-    g_teleportPermissionProbeOriginY = player_y;
-    g_teleportPermissionProbeOriginZ = player_z;
-    g_teleportPermissionProbeOriginValid = true;
-    g_verifiedTeleportCredential.store(0, std::memory_order_release);
-    g_verifiedTeleportDimensionToken.store(0, std::memory_order_relaxed);
-    g_verifiedTeleportAtNs.store(0, std::memory_order_relaxed);
+    g_buildExportTeleportDispatching = false;
+    g_buildExportTeleportSent = false;
+    g_buildExportTeleportAccepted = false;
+    g_buildExportTeleportDetail = "Sending TP to the export region centre";
+    g_buildExportTeleportUntaggedFailure.clear();
+    g_buildExportTeleportDimensionToken = request_dimension;
+    g_buildExportTeleportDeadlineNs = now + 6LL * 1000LL * 1000LL * 1000LL;
+    g_buildExportTeleportActive = true;
+    g_buildExportTeleportTarget = target;
+    g_buildExportTeleportOriginX = player_x;
+    g_buildExportTeleportOriginY = player_y;
+    g_buildExportTeleportOriginZ = player_z;
+    g_buildExportTeleportOriginValid = true;
     LOGI("teleport movement probe %llu queued from (%d, %d, %d) to (%.1f, %.1f, %.1f)",
          static_cast<unsigned long long>(request), player_x, player_y, player_z, x, y, z);
     return true;
 }
 
-bool IsTeleportPermissionProbePending() {
-    std::lock_guard<std::mutex> lock(g_teleportPermissionProbeMutex);
-    return g_teleportPermissionProbePublishesTeleport &&
-        g_teleportPermissionProbeCompleted < g_teleportPermissionProbeRequested;
-}
-
-void CancelPendingTeleportRequest() {
-    // This also completes any in-flight movement probe, so a late successful
-    // acknowledgement cannot republish a teleport after export cancellation.
-    InvalidateTeleportCommandPermission();
+bool IsBuildExportTeleportPending() {
+    std::lock_guard<std::mutex> lock(g_buildExportTeleportMutex);
+    return g_buildExportTeleportActive &&
+        g_buildExportTeleportCompleted < g_buildExportTeleportRequested;
 }
 
 bool IsMinecraftUpdateGameThread() noexcept {
@@ -1241,7 +785,7 @@ bool IsMinecraftUpdateGameThread() noexcept {
 }
 
 bool QueryWorldContextOnGameThread(std::string* output, int timeout_ms) {
-    if (!IsNativeSessionAuthorized() || !output || timeout_ms <= 0 ||
+    if (!output || timeout_ms <= 0 ||
         !g_hookInstalled.load(std::memory_order_acquire)) {
         return false;
     }
@@ -1269,46 +813,4 @@ bool QueryWorldContextOnGameThread(std::string* output, int timeout_ms) {
 uintptr_t GetCachedDimensionTokenForWorld(const std::string& world_context) {
     std::lock_guard<std::mutex> lock(g_worldContextMutex);
     return world_context == g_cachedWorldContext ? g_cachedDimensionToken : 0;
-}
-
-bool QueryPlayerPermissionOnGameThread(int* output, int timeout_ms) {
-    const bool session_authorized = IsNativeSessionAuthorized();
-    const bool hook_installed = g_hookInstalled.load(std::memory_order_acquire);
-    if (!session_authorized || !output || timeout_ms <= 0 || !hook_installed) {
-        LOGE("player-permission query rejected before dispatch: session=%s output=%s "
-             "timeout_ms=%d hook=%s",
-             session_authorized ? "active" : "inactive",
-             output ? "present" : "null", timeout_ms,
-             hook_installed ? "installed" : "missing");
-        return false;
-    }
-    *output = -1;
-
-    std::thread::id game_thread_id;
-    {
-        std::lock_guard<std::mutex> lock(g_worldContextMutex);
-        game_thread_id = g_gameThreadId;
-    }
-
-    std::unique_lock<std::mutex> lock(g_playerPermissionMutex);
-    const uint64_t request = ++g_playerPermissionRequested;
-    if (game_thread_id == std::this_thread::get_id()) {
-        lock.unlock();
-        ServicePlayerPermissionRequest();
-        lock.lock();
-    } else if (!g_playerPermissionCondition.wait_for(
-                   lock, std::chrono::milliseconds(timeout_ms),
-                   [&]() { return g_playerPermissionCompleted >= request; })) {
-        LOGE("player-permission request %llu timed out after %d ms (local_player=%s)",
-             static_cast<unsigned long long>(request), timeout_ms,
-             g_localPlayer.load(std::memory_order_acquire) ? "captured" : "missing");
-        return false;
-    }
-    if (g_playerPermissionCompleted < request || !g_cachedPlayerPermissionValid) {
-        LOGE("player-permission request %llu completed without a valid level",
-             static_cast<unsigned long long>(request));
-        return false;
-    }
-    *output = g_cachedPlayerPermission;
-    return true;
 }

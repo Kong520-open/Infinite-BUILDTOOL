@@ -225,13 +225,6 @@ bool addBoundsVolume(const BlockBounds& bounds, uint64_t* total) {
     return true;
 }
 constexpr size_t kUnthrottledPlacementBatchCommands = 1024;
-constexpr int32_t kLimitedImportMaximumBlocksPerSecond = 500;
-constexpr uint64_t kLimitedImportMaximumOutputBlocks = 50'000;
-constexpr auto kLimitedImportRollingWindow = std::chrono::seconds(1);
-// Limited imports receive no backlog/catch-up budget.  The command-plan cap
-// below keeps every generated /fill within a single paced placement slice, so
-// this limit remains enforceable for an individual command as well as a batch.
-constexpr uint32_t kLimitedImportRateSlicesPerSecond = 20;
 constexpr uint32_t kMaxSchedulerTransitionsPerTick = 64;
 constexpr uint32_t kMaxDeferredWindowUnits = 256;
 // At most this many completed regions may keep their ticking area alive
@@ -343,34 +336,6 @@ static_assert(sizeof(DeferredDataStateDiskV1) == 24,
 bool commandBlockStateExists(const std::string& path) {
     struct stat status {};
     return !path.empty() && stat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode);
-}
-
-bool endsWithIgnoreCase(std::string_view value, std::string_view suffix) {
-    if (value.size() < suffix.size()) return false;
-    const size_t offset = value.size() - suffix.size();
-    for (size_t index = 0; index < suffix.size(); ++index) {
-        const unsigned char lhs = static_cast<unsigned char>(value[offset + index]);
-        const unsigned char rhs = static_cast<unsigned char>(suffix[index]);
-        if (std::tolower(lhs) != std::tolower(rhs)) return false;
-    }
-    return true;
-}
-
-uint32_t limitedImportMaximumCommandBlocks(int32_t blocks_per_second) {
-    const uint32_t bounded_rate = static_cast<uint32_t>(std::max<int32_t>(
-        1, std::min<int32_t>(blocks_per_second, kLimitedImportMaximumBlocksPerSecond)));
-    // The planner's 50 ms target is a transport-size optimization, not a
-    // second quota.  Explicitly cap it at the complete rolling-window budget
-    // too, so even the smallest configured rate still produces a dispatchable
-    // one-block command rather than an impossible zero-sized allowance.
-    const uint32_t slice_blocks = std::max<uint32_t>(1U,
-        (bounded_rate + kLimitedImportRateSlicesPerSecond - 1U) /
-        kLimitedImportRateSlicesPerSecond);
-    return std::min(bounded_rate, slice_blocks);
-}
-
-bool isLimitedImportPathAllowed(const std::string& path) {
-    return endsWithIgnoreCase(path, ".schem") || endsWithIgnoreCase(path, ".schematic");
 }
 
 bool loadCommandBlockState(const std::string& path, uint64_t expected_count,
@@ -2480,28 +2445,6 @@ bool BuildImportRuntime::start(BuildImportStartRequest request, std::string* err
         if (error) *error = "MP3 command-music import has been removed; use a .mid or .midi file";
         return false;
     }
-    const bool limited_import = isLimitedBuildToolsImport(request.config.access_profile);
-    if (limited_import) {
-        // Never trust only the Java file filter: native callers must be unable
-        // to relabel a BDX/litematic/pixel job as a limited schematic import.
-        if (request.source_type != ImportSourceType::Schematic ||
-            !isLimitedImportPathAllowed(request.parse.source_path)) {
-            if (error) *error = "limited building import accepts only .schem or .schematic files";
-            return false;
-        }
-        request.config.blocks_per_second = std::max<int32_t>(1, std::min<int32_t>(
-            request.config.blocks_per_second, kLimitedImportMaximumBlocksPerSecond));
-        request.parse.maximum_output_blocks = request.parse.maximum_output_blocks == 0
-            ? kLimitedImportMaximumOutputBlocks
-            : std::min<uint64_t>(request.parse.maximum_output_blocks,
-                                 kLimitedImportMaximumOutputBlocks);
-        // Parsed non-air blocks are the advertised limited quota.  Do not let
-        // an unverified import multiply its world effect through clearing,
-        // deny foundations, repair passes, or post-placement data payloads.
-        request.config.overwrite_policy = OverwritePolicy::PreserveExisting;
-        request.config.place_deny_layer = false;
-        request.config.verify_after_import = false;
-    }
     request.config.source_type = request.source_type;
     request.config.create_maps_after_import =
         request.source_type == ImportSourceType::PixelArtPng &&
@@ -2656,10 +2599,9 @@ bool BuildImportRuntime::start(BuildImportStartRequest request, std::string* err
         blocks_per_second_ = request.config.blocks_per_second;
         suppress_command_feedback_.store(
             request.config.suppress_command_feedback, std::memory_order_release);
-        placement_rate_limiting_enabled_ = limited_import;
     }
     throughput_governor_.resetFeedback();
-    resetRateLimiter(std::chrono::steady_clock::now());
+    resetPlacementBatch();
     const uint64_t generation = run_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     worker_running_.store(true, std::memory_order_release);
     try {
@@ -2876,7 +2818,6 @@ bool BuildImportRuntime::undoLastImport(const std::string& storage_directory,
     config.simulation_chunk_range = manifest->simulation_chunk_range;
     config.blocks_per_second = manifest->blocks_per_second;
     config.source_type = ImportSourceType::Schematic;
-    config.access_profile = BuildToolsAccessProfile::Full;
     config.overwrite_policy = OverwritePolicy::ClearImportedBounds;
     config.place_deny_layer = false;
     config.verify_after_import = false;
@@ -2951,10 +2892,9 @@ bool BuildImportRuntime::undoLastImport(const std::string& storage_directory,
         total_block_count_ = undo_block_count;
         imported_block_count_ = 0;
         blocks_per_second_ = config.blocks_per_second;
-        placement_rate_limiting_enabled_ = false;
     }
     throughput_governor_.resetFeedback();
-    resetRateLimiter(std::chrono::steady_clock::now());
+    resetPlacementBatch();
 
     const uint64_t generation = run_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     worker_running_.store(true, std::memory_order_release);
@@ -3149,13 +3089,7 @@ bool BuildImportRuntime::persistUndoSnapshot(std::string* error) {
 }
 
 bool BuildImportRuntime::restore(const std::string& spool_directory,
-                                  const WorldContext& context, std::string* error) {
-    return restore(spool_directory, context, BuildToolsAccessProfile::Full, error);
-}
-
-bool BuildImportRuntime::restore(const std::string& spool_directory,
                                   const WorldContext& context,
-                                  BuildToolsAccessProfile caller_profile,
                                   std::string* error) try {
     bool expected = false;
     if (!restore_in_progress_.compare_exchange_strong(expected, true,
@@ -3190,11 +3124,6 @@ bool BuildImportRuntime::restore(const std::string& spool_directory,
 
     auto snapshot = BuildImportCheckpoint::load(spool_directory + "/checkpoint.bin", error);
     if (!snapshot) return false;
-    if (isLimitedBuildToolsImport(caller_profile) &&
-        !isLimitedBuildToolsImport(snapshot->config.access_profile)) {
-        if (error) *error = "this checkpoint requires full building-tools authorization";
-        return false;
-    }
     if (!validateRestorablePlan(*snapshot, error)) return false;
     if (!(snapshot->world == context)) {
         if (error) *error = "current world or dimension does not match checkpoint";
@@ -3304,18 +3233,6 @@ bool BuildImportRuntime::restore(const std::string& spool_directory,
             return false;
         }
     }
-    const bool limited_import = isLimitedBuildToolsImport(snapshot->config.access_profile);
-    if (limited_import) {
-        if (snapshot->config.source_type != ImportSourceType::Schematic ||
-            !isLimitedImportPathAllowed(snapshot->identity.source_file) ||
-            total_blocks > kLimitedImportMaximumOutputBlocks ||
-            snapshot->config.blocks_per_second > kLimitedImportMaximumBlocksPerSecond ||
-            snapshot->config.overwrite_policy != OverwritePolicy::PreserveExisting ||
-            snapshot->config.place_deny_layer || snapshot->config.verify_after_import) {
-            if (error) *error = "limited import checkpoint violates the restricted building-tools policy";
-            return false;
-        }
-    }
     std::lock_guard<std::recursive_mutex> lifecycle_lock(lifecycle_mutex_);
     if (run_generation_.load(std::memory_order_acquire) != baseline_generation ||
         controller_.state() != baseline_state || isRestoreBusyState(controller_.state())) {
@@ -3407,10 +3324,9 @@ bool BuildImportRuntime::restore(const std::string& spool_directory,
             ? durable_undo_block_count_
             : std::min(total_block_count_, restored_snapshot.completed_block_count);
         blocks_per_second_ = restored_snapshot.config.blocks_per_second;
-        placement_rate_limiting_enabled_ = limited_import;
     }
     throughput_governor_.resetFeedback();
-    resetRateLimiter(std::chrono::steady_clock::now());
+    resetPlacementBatch();
     if (previous_directory_relation == DirectoryRelation::Different) {
         cleanupSpoolDirectory(previous_spool_directory);
     }
@@ -3547,8 +3463,7 @@ void BuildImportRuntime::parseWorker(BuildImportStartRequest request, uint64_t g
     std::remove((container_item_spool_path_to_clear + ".tmp").c_str());
     std::remove((parse_spool_directory + "/" + kContainerItemStateFileName).c_str());
     std::remove((parse_spool_directory + "/" + kContainerItemStateFileName + ".tmp").c_str());
-    if (request.source_type != ImportSourceType::PixelArtPng &&
-        !isLimitedBuildToolsImport(request.config.access_profile)) {
+    if (request.source_type != ImportSourceType::PixelArtPng) {
         command_block_writer = std::make_unique<CommandBlockSpoolWriter>(
             parse_spool_directory);
         sign_writer = std::make_unique<SignSpoolWriter>(parse_spool_directory);
@@ -3984,10 +3899,7 @@ void BuildImportRuntime::parseWorker(BuildImportStartRequest request, uint64_t g
                                      command_progress,
                                      request.config.verify_after_import,
                                      request.config.place_deny_layer,
-                                     isLimitedBuildToolsImport(request.config.access_profile)
-                                          ? limitedImportMaximumCommandBlocks(
-                                                request.config.blocks_per_second)
-                                          : 0U)) {
+                                     0U)) {
         cleanupSpoolDirectory(parse_spool_directory);
         if (abandoned()) return;
         controller_.failActiveUnit(error);
@@ -4179,13 +4091,6 @@ void BuildImportRuntime::onGameTick() try {
     if (observed_state != ImportState::Running && !draining_deferred_window) return;
     if (region_add_ready_at_.time_since_epoch().count() && now < region_add_ready_at_) return;
     if (region_add_ready_at_.time_since_epoch().count()) region_add_ready_at_ = {};
-    if (placement_rate_limiting_enabled_) {
-        // Retained only for the paced variant: unpaced placement may use every
-        // game tick immediately after a previous batch returns.
-        if (last_tick_.time_since_epoch().count() &&
-            now - last_tick_ < std::chrono::milliseconds(4)) return;
-        last_tick_ = now;
-    }
     if constexpr (kDataQueueBarriersEnabled) {
         // Queue barriers are disabled for the unpaced import path.
         if (!servicePipelinedDataBarrier(now)) return;
@@ -4294,25 +4199,15 @@ drive_active_stage:
             }
             return;
         }
-        refillRateTokens(now);
-        const uint64_t limited_window_remaining = placement_rate_limiting_enabled_
-            ? limitedWindowRemaining(now) : std::numeric_limits<uint64_t>::max();
-        if (placement_rate_limiting_enabled_ &&
-            (limited_window_remaining == 0 || available_block_tokens_ < 1.0 ||
-             available_command_tokens_ < 1.0)) return;
+        preparePlacementBatch();
         const size_t remaining_commands = clear_plan_.size() - clear_index_;
-        if (placement_rate_limiting_enabled_ && !throughput_governor_.dispatchReady(now) &&
-            remaining_commands > max_batch_commands_) return;
         const auto deadline = scheduler_deadline;
         const auto batch_build_started = std::chrono::steady_clock::now();
         batch_commands_.clear();
         batch_block_counts_.clear();
         batch_commands_.reserve(std::min(remaining_commands, max_batch_commands_));
         batch_block_counts_.reserve(std::min(remaining_commands, max_batch_commands_));
-        double tentative_block_tokens = placement_rate_limiting_enabled_
-            ? std::min(available_block_tokens_,
-                       static_cast<double>(limited_window_remaining))
-            : available_block_tokens_;
+        double tentative_block_tokens = available_block_tokens_;
         double tentative_command_tokens = available_command_tokens_;
         while (clear_index_ + batch_commands_.size() < clear_plan_.size() &&
                tentative_block_tokens >= 1.0 && tentative_command_tokens >= 1.0 &&
@@ -4320,10 +4215,6 @@ drive_active_stage:
                !commandBatchDeadlineReached(batch_commands_.size(), deadline)) {
             const PlannedCommand& planned =
                 clear_plan_[clear_index_ + batch_commands_.size()];
-            if (placement_rate_limiting_enabled_ &&
-                static_cast<double>(planned.block_count) > tentative_block_tokens) {
-                break;
-            }
             batch_commands_.push_back(commandFor(planned));
             batch_block_counts_.push_back(planned.block_count);
             tentative_block_tokens -= planned.block_count;
@@ -4381,24 +4272,12 @@ drive_active_stage:
             stage_ = ExecuteStage::Cleanup;
             return;
         }
-        refillRateTokens(now);
-        const uint64_t limited_window_remaining = placement_rate_limiting_enabled_
-            ? limitedWindowRemaining(now) : std::numeric_limits<uint64_t>::max();
-        if (placement_rate_limiting_enabled_ &&
-            (limited_window_remaining == 0 || available_block_tokens_ < 1.0 ||
-             available_command_tokens_ < 1.0)) return;
-        const uint64_t remaining_commands = command_prefetcher_
-            ? command_prefetcher_->remainingCommands() : 0;
-        if (placement_rate_limiting_enabled_ && !throughput_governor_.dispatchReady(now) &&
-            remaining_commands > max_batch_commands_) return;
+        preparePlacementBatch();
         const auto deadline = scheduler_deadline;
         const auto batch_build_started = std::chrono::steady_clock::now();
         CommandBatchPrefetcher::TakeResult prefetched;
         if (command_prefetcher_) {
-            const double effective_block_tokens = placement_rate_limiting_enabled_
-                ? std::min(available_block_tokens_,
-                           static_cast<double>(limited_window_remaining))
-                : available_block_tokens_;
+            const double effective_block_tokens = available_block_tokens_;
             prefetched = command_prefetcher_->take(
                 max_batch_commands_, effective_block_tokens, available_command_tokens_,
                 deadline, &batch_commands_, &batch_block_counts_);
@@ -4461,7 +4340,7 @@ drive_active_stage:
         if (stage_ != ExecuteStage::Cleanup) return;
     }
     if (stage_ == ExecuteStage::Drain) {
-        refillRateTokens(now);
+        preparePlacementBatch();
         const std::string eager_failure = takeDrainFailure();
         if (!eager_failure.empty()) {
             scheduleActiveUnitRecovery(eager_failure);
@@ -5079,7 +4958,6 @@ void BuildImportRuntime::resetVerificationRuntime() {
     verification_repair_phase_dirty_ = false;
     verification_repair_settle_ready_at_ = {};
     verification_repair_reader_.reset();
-    verification_repair_pending_command_.reset();
     verification_repair_reader_chunk_filter_.clear();
     resetDrainBarrier();
     // Defensive: a background data barrier is always absorbed before the run
@@ -5722,25 +5600,6 @@ void BuildImportRuntime::noteDataCommandsSent(
             ? std::numeric_limits<uint64_t>::max()
             : unbarriered_block_count_ + block_count;
     }
-    if (placement_rate_limiting_enabled_) {
-        // The selected batch was constrained before dispatch, but account only
-        // for the prefix the transport actually accepted.  In particular, a
-        // partial RPC send must not consume rate budget for commands that were
-        // never handed to the game.
-        pruneLimitedSendHistory(sent_at);
-        if (block_count != 0) {
-            if (block_count > std::numeric_limits<uint64_t>::max() -
-                    limited_window_blocks_) {
-                limited_window_blocks_ = std::numeric_limits<uint64_t>::max();
-            } else {
-                limited_window_blocks_ += block_count;
-            }
-            limited_send_history_.push_back({sent_at, block_count});
-        }
-        available_block_tokens_ -= static_cast<double>(block_count);
-        available_command_tokens_ -= static_cast<double>(command_count);
-        throughput_governor_.noteDispatch(sent_at, command_count);
-    }
     active_unit_last_send_at_ = sent_at;
     telemetry_data_commands_ += command_count;
     telemetry_data_blocks_ += block_count;
@@ -5983,105 +5842,15 @@ void BuildImportRuntime::resetDrainBarrier() {
     drain_failure_.clear();
 }
 
-void BuildImportRuntime::refillRateTokens(std::chrono::steady_clock::time_point now) {
-    if (!placement_rate_limiting_enabled_) {
-        available_block_tokens_ = std::numeric_limits<double>::infinity();
-        available_command_tokens_ = std::numeric_limits<double>::infinity();
-        max_batch_commands_ = kUnthrottledPlacementBatchCommands;
-        last_rate_refill_ = now;
-        return;
-    }
-    int32_t rate = 20;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        rate = std::max<int32_t>(1, blocks_per_second_);
-    }
-    if (!last_rate_refill_.time_since_epoch().count()) last_rate_refill_ = now;
-    const double elapsed = std::chrono::duration<double>(now - last_rate_refill_).count();
-    last_rate_refill_ = now;
-    throughput_governor_.setRequestedBlocksPerSecond(rate);
-    const BuildImportThroughputPolicy policy = throughput_governor_.policy();
-    // Do not accumulate an unverified import's placement allowance through a
-    // world-load stall.  One 50 ms slice is the only permitted burst.
-    const double maximum_block_burst = static_cast<double>(
-        limitedImportMaximumCommandBlocks(rate));
-    const uint64_t remaining_window_commands = unbarriered_command_count_ <
-            kMaxUnbarrieredCommands
-        ? kMaxUnbarrieredCommands - unbarriered_command_count_ : 0;
-    max_batch_commands_ = std::min(
-        throughput_governor_.dispatchBatchLimit(now),
-        static_cast<size_t>(remaining_window_commands));
-    available_block_tokens_ = std::min(
-        maximum_block_burst,
-        available_block_tokens_ + elapsed * policy.block_rate_per_second);
-    available_command_tokens_ = std::min(
-        policy.catch_up_command_burst,
-        available_command_tokens_ + elapsed * policy.command_rate_per_second);
+void BuildImportRuntime::preparePlacementBatch() {
+    available_block_tokens_ = std::numeric_limits<double>::infinity();
+    available_command_tokens_ = std::numeric_limits<double>::infinity();
+    max_batch_commands_ = kUnthrottledPlacementBatchCommands;
 }
 
-void BuildImportRuntime::resetRateLimiter(std::chrono::steady_clock::time_point now) {
-    if (!placement_rate_limiting_enabled_) {
-        // A full-authorized import does not add ledger entries, but do not
-        // clear a recent restricted-profile ledger here.  The same runtime can
-        // be cancelled and immediately restarted with a restricted profile;
-        // clearing it would create a one-second quota bypass.  Old entries are
-        // pruned naturally when the next restricted dispatch asks for the
-        // window remainder.
-        pruneLimitedSendHistory(now);
-        available_block_tokens_ = std::numeric_limits<double>::infinity();
-        available_command_tokens_ = std::numeric_limits<double>::infinity();
-        max_batch_commands_ = kUnthrottledPlacementBatchCommands;
-        throughput_governor_.resetDispatchCadence();
-        last_rate_refill_ = now;
-        last_tick_ = {};
-        return;
-    }
-    pruneLimitedSendHistory(now);
-    int32_t rate = 20;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        rate = std::max<int32_t>(1, blocks_per_second_);
-    }
-    throughput_governor_.setRequestedBlocksPerSecond(rate);
+void BuildImportRuntime::resetPlacementBatch() {
+    preparePlacementBatch();
     throughput_governor_.resetDispatchCadence();
-    const BuildImportThroughputPolicy policy = throughput_governor_.policy();
-    // Start empty. A prefilled bucket would permit an immediate extra burst
-    // before the configured placement rate has elapsed.
-    available_block_tokens_ = 0.0;
-    available_command_tokens_ = 0.0;
-    max_batch_commands_ = policy.max_batch_commands;
-    last_rate_refill_ = now;
-    last_tick_ = {};
-}
-
-void BuildImportRuntime::pruneLimitedSendHistory(
-        std::chrono::steady_clock::time_point now) {
-    while (!limited_send_history_.empty()) {
-        const LimitedSendRecord& oldest = limited_send_history_.front();
-        // Keep an event that is exactly one second old.  This makes the cap
-        // conservative at the boundary: a closed trailing one-second interval
-        // can never contain more than the configured number of sent blocks.
-        if (now <= oldest.sent_at || now - oldest.sent_at <= kLimitedImportRollingWindow) {
-            break;
-        }
-        limited_window_blocks_ = oldest.block_count > limited_window_blocks_
-            ? 0
-            : limited_window_blocks_ - oldest.block_count;
-        limited_send_history_.pop_front();
-    }
-}
-
-uint64_t BuildImportRuntime::limitedWindowRemaining(
-        std::chrono::steady_clock::time_point now) {
-    pruneLimitedSendHistory(now);
-    int32_t configured_rate = 1;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        configured_rate = blocks_per_second_;
-    }
-    const uint64_t limit = static_cast<uint64_t>(std::max<int32_t>(
-        1, std::min<int32_t>(configured_rate, kLimitedImportMaximumBlocksPerSecond)));
-    return limited_window_blocks_ >= limit ? 0 : limit - limited_window_blocks_;
 }
 
 void BuildImportRuntime::maybeLogPerformanceTelemetry(
@@ -6861,7 +6630,6 @@ void BuildImportRuntime::beginFinalVerification() {
     verification_repair_chunk_.reset();
     verification_repair_tracker_.reset();
     verification_repair_reader_.reset();
-    verification_repair_pending_command_.reset();
     verification_repair_reader_chunk_filter_.clear();
     stage_ = ExecuteStage::Verify;
     const BuildImportRuntimeMetadata metadata = controller_.runtimeMetadata();
@@ -6925,7 +6693,7 @@ void BuildImportRuntime::beginFinalVerification() {
     verification_sample_index_ = static_cast<size_t>(metadata.verification_sample_index);
     verification_sample_ready_at_ = std::max(
         std::chrono::steady_clock::now() + std::chrono::milliseconds(200), region_add_ready_at_);
-    resetRateLimiter(std::chrono::steady_clock::now());
+    resetPlacementBatch();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         status_ = "verifying " + std::to_string(verification_verified_chunks_) +
@@ -7265,7 +7033,6 @@ void BuildImportRuntime::scheduleChunkRepair(const ChunkCoord& chunk, size_t sam
     verification_repair_emitted_blocks_ = 0;
     verification_repair_transport_failures_ = 0;
     verification_repair_reader_.reset();
-    verification_repair_pending_command_.reset();
     verification_repair_reader_chunk_filter_.clear();
     verification_repair_force_drain_ = false;
     verification_repair_phase_dirty_ = false;
@@ -7317,7 +7084,7 @@ void BuildImportRuntime::scheduleChunkRepair(const ChunkCoord& chunk, size_t sam
         std::make_move_iterator(repair_foundation_plan.end()));
     verification_repair_phase_ = phaseIndex(
         verification_repair_clear_plan_.empty() ? ImportPhase::Structure : ImportPhase::Clear);
-    resetRateLimiter(now);
+    resetPlacementBatch();
     std::lock_guard<std::mutex> lock(mutex_);
     status_ = overwrite
         ? "sample mismatch; rebuilding complete loaded region (" +
@@ -7343,7 +7110,6 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
             active_unit_last_send_at_.time_since_epoch().count() != 0;
     invalidateRpcTransport();
         verification_repair_reader_.reset();
-        verification_repair_pending_command_.reset();
         verification_repair_reader_chunk_filter_.clear();
         verification_repair_phase_ = phaseIndex(
             verification_repair_clear_plan_.empty()
@@ -7365,7 +7131,7 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
             drain_barrier_confirmed_;
         if (!verification_repair_force_drain_ && !drain_in_progress &&
             !dataWindowNeedsDrain()) return true;
-        refillRateTokens(now);
+        preparePlacementBatch();
         if (!dataCommandsDrained(now, false)) {
             if (!takeDrainFailure().empty()) restartForTransport();
             return false;
@@ -7434,25 +7200,15 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
 
     if (verification_repair_phase_ == phaseIndex(ImportPhase::Clear)) {
         if (verification_repair_clear_index_ < verification_repair_clear_plan_.size()) {
-            refillRateTokens(now);
-            const uint64_t limited_window_remaining = placement_rate_limiting_enabled_
-                ? limitedWindowRemaining(now) : std::numeric_limits<uint64_t>::max();
-            if (placement_rate_limiting_enabled_ &&
-                (limited_window_remaining == 0 || available_block_tokens_ < 1.0 ||
-                 available_command_tokens_ < 1.0)) return;
+            preparePlacementBatch();
             const size_t remaining_commands =
                 verification_repair_clear_plan_.size() - verification_repair_clear_index_;
-            if (placement_rate_limiting_enabled_ && !throughput_governor_.dispatchReady(now) &&
-                remaining_commands > max_batch_commands_) return;
             const auto deadline = now + kCommandBatchBuildBudget;
             std::vector<std::string> commands;
             std::vector<uint32_t> block_counts;
             commands.reserve(std::min(remaining_commands, max_batch_commands_));
             block_counts.reserve(std::min(remaining_commands, max_batch_commands_));
-            double tentative_block_tokens = placement_rate_limiting_enabled_
-                ? std::min(available_block_tokens_,
-                           static_cast<double>(limited_window_remaining))
-                : available_block_tokens_;
+            double tentative_block_tokens = available_block_tokens_;
             double tentative_command_tokens = available_command_tokens_;
             while (verification_repair_clear_index_ + commands.size() <
                        verification_repair_clear_plan_.size() &&
@@ -7461,10 +7217,6 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
                    !commandBatchDeadlineReached(commands.size(), deadline)) {
                 const PlannedCommand& planned = verification_repair_clear_plan_[
                     verification_repair_clear_index_ + commands.size()];
-                if (placement_rate_limiting_enabled_ &&
-                    static_cast<double>(planned.block_count) > tentative_block_tokens) {
-                    break;
-                }
                 commands.push_back(commandFor(planned));
                 block_counts.push_back(planned.block_count);
                 tentative_block_tokens -= planned.block_count;
@@ -7487,7 +7239,7 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
             }
             return;
         }
-        refillRateTokens(now);
+        preparePlacementBatch();
         if (!repairPhaseDrained(ImportPhase::Clear, now)) {
             if (!takeDrainFailure().empty()) restartForTransport();
             return;
@@ -7507,7 +7259,7 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
             ? verification_repair_halo_chunks_.size() : 0;
         const size_t chunk_count = base_count + halo_count;
         if (verification_repair_chunk_cursor_ >= chunk_count) {
-            refillRateTokens(now);
+            preparePlacementBatch();
             if (!repairPhaseDrained(phase, now)) {
                 if (!takeDrainFailure().empty()) restartForTransport();
                 return;
@@ -7538,7 +7290,6 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
             continue;
         }
         verification_repair_reader_ = std::make_unique<CommandSpoolReader>(path);
-        verification_repair_pending_command_.reset();
         if (!verification_repair_reader_->valid()) {
             finishFinalVerification(false, "cannot open chunk repair command spool");
             return;
@@ -7558,7 +7309,6 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
     if (verification_repair_phase_ == phaseIndex(ImportPhase::Count)) {
         verification_repair_chunk_.reset();
         verification_repair_reader_.reset();
-        verification_repair_pending_command_.reset();
         verification_repair_reader_chunk_filter_.clear();
         verification_sample_index_ = verification_repair_sample_begin_;
         controller_.recordVerificationProgress(verification_sample_index_, false, nullptr);
@@ -7571,43 +7321,24 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
         return;
     }
 
-    if (verification_repair_reader_ && !verification_repair_pending_command_ &&
+    if (verification_repair_reader_ &&
         verification_repair_reader_->exhausted()) {
         verification_repair_reader_.reset();
-        verification_repair_pending_command_.reset();
         verification_repair_reader_chunk_filter_.clear();
         ++verification_repair_chunk_cursor_;
         return;
     }
-    refillRateTokens(now);
-    const uint64_t limited_window_remaining = placement_rate_limiting_enabled_
-        ? limitedWindowRemaining(now) : std::numeric_limits<uint64_t>::max();
-    if (placement_rate_limiting_enabled_ &&
-        (limited_window_remaining == 0 || available_block_tokens_ < 1.0 ||
-         available_command_tokens_ < 1.0)) return;
-    const uint64_t remaining_commands = verification_repair_reader_->commandCount() -
-        verification_repair_reader_->commandsRead();
-    if (placement_rate_limiting_enabled_ && !throughput_governor_.dispatchReady(now) &&
-        remaining_commands > max_batch_commands_) return;
+    preparePlacementBatch();
     const auto deadline = now + kCommandBatchBuildBudget;
     std::vector<std::string> commands;
     std::vector<uint32_t> block_counts;
     bool reached_end = false;
-    double tentative_block_tokens = placement_rate_limiting_enabled_
-        ? std::min(available_block_tokens_,
-                   static_cast<double>(limited_window_remaining))
-        : available_block_tokens_;
+    double tentative_block_tokens = available_block_tokens_;
     double tentative_command_tokens = available_command_tokens_;
     while (tentative_block_tokens >= 1.0 && tentative_command_tokens >= 1.0 &&
            commands.size() < max_batch_commands_ &&
            !commandBatchDeadlineReached(commands.size(), deadline)) {
-        std::optional<PlannedCommand> command;
-        if (verification_repair_pending_command_) {
-            command = std::move(verification_repair_pending_command_);
-            verification_repair_pending_command_.reset();
-        } else {
-            command = verification_repair_reader_->next();
-        }
+        auto command = verification_repair_reader_->next();
         if (!command) {
             reached_end = true;
             break;
@@ -7636,15 +7367,6 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
                 continue;
             }
         }
-        // CommandSpoolReader::next() advances its cursor immediately. Retain a
-        // command that does not fit the current token/window remainder so it is
-        // retried intact after the rolling window opens; otherwise a partial
-        // window could both skip the command and overrun the strict cap.
-        if (placement_rate_limiting_enabled_ &&
-            static_cast<double>(command->block_count) > tentative_block_tokens) {
-            verification_repair_pending_command_ = std::move(command);
-            break;
-        }
         commands.push_back(commandFor(*command));
         block_counts.push_back(command->block_count);
         tentative_block_tokens -= command->block_count;
@@ -7667,7 +7389,7 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
             return;
         }
     }
-    if (verification_repair_reader_ && !verification_repair_pending_command_ &&
+    if (verification_repair_reader_ &&
         verification_repair_reader_->exhausted()) reached_end = true;
     if (reached_end) {
         if (verification_repair_reader_->failed()) {
@@ -7675,7 +7397,6 @@ void BuildImportRuntime::tickChunkRepair(std::chrono::steady_clock::time_point n
             return;
         }
         verification_repair_reader_.reset();
-        verification_repair_pending_command_.reset();
         verification_repair_reader_chunk_filter_.clear();
         ++verification_repair_chunk_cursor_;
     }
@@ -13466,21 +13187,9 @@ void BuildImportRuntime::pause() {
           "; execution stopped";
 }
 
-bool BuildImportRuntime::resume(const WorldContext& context, std::string* error) {
-    return resume(context, BuildToolsAccessProfile::Full, error);
-}
-
 bool BuildImportRuntime::resume(const WorldContext& context,
-                                BuildToolsAccessProfile caller_profile,
                                 std::string* error) {
     std::lock_guard<std::recursive_mutex> lifecycle_lock(lifecycle_mutex_);
-    if (isLimitedBuildToolsImport(caller_profile)) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!placement_rate_limiting_enabled_) {
-            if (error) *error = "this import requires full building-tools authorization";
-            return false;
-        }
-    }
     if (!controller_.resume(context, error)) return false;
     releaseLoadedRegion(true);
     WorkUnit stale_area;
@@ -13574,13 +13283,8 @@ void BuildImportRuntime::resetCurrentRun(bool discard_files) {
     total_block_count_ = 0;
     imported_block_count_ = 0;
     blocks_per_second_ = 20;
-    placement_rate_limiting_enabled_ = false;
     available_block_tokens_ = 1.0;
     available_command_tokens_ = 1.0;
-    // Do not clear limited_send_history_ here.  A caller can cancel and
-    // immediately start/restore another restricted import; the trailing
-    // one-second ledger must survive that lifecycle transition.
-    last_rate_refill_ = {};
     telemetry_window_started_at_ = {};
     telemetry_data_commands_ = 0;
     telemetry_data_blocks_ = 0;
@@ -13628,11 +13332,6 @@ uint64_t BuildImportRuntime::totalBlockCount() const {
 uint64_t BuildImportRuntime::importedBlockCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return imported_block_count_;
-}
-
-bool BuildImportRuntime::isLimitedImportProfile() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return placement_rate_limiting_enabled_;
 }
 
 }  // namespace build_import

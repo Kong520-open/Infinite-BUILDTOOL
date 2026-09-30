@@ -63,20 +63,15 @@ public:
                           std::string* error = nullptr);
     bool restore(const std::string& spool_directory, const WorldContext& context,
                  std::string* error = nullptr);
-    bool restore(const std::string& spool_directory, const WorldContext& context,
-                 BuildToolsAccessProfile caller_profile, std::string* error);
     void onGameTick();
     void onWorldContextChanged(const WorldContext& context);
     void pause();
     bool resume(const WorldContext& context, std::string* error = nullptr);
-    bool resume(const WorldContext& context, BuildToolsAccessProfile caller_profile,
-                std::string* error);
     void cancel();
     ImportState state() const;
     std::string status() const;
     uint64_t totalBlockCount() const;
     uint64_t importedBlockCount() const;
-    bool isLimitedImportProfile() const;
     // Returns true when the packet is an importer-owned silent command result
     // that must not be forwarded into the game's command-feedback UI.
     bool onRawNetworkPacket(const std::string& packet);
@@ -161,10 +156,8 @@ private:
     bool repairPhaseDrained(ImportPhase phase,
                             std::chrono::steady_clock::time_point now);
     std::string takeDrainFailure();
-    void refillRateTokens(std::chrono::steady_clock::time_point now);
-    void resetRateLimiter(std::chrono::steady_clock::time_point now);
-    void pruneLimitedSendHistory(std::chrono::steady_clock::time_point now);
-    uint64_t limitedWindowRemaining(std::chrono::steady_clock::time_point now);
+    void preparePlacementBatch();
+    void resetPlacementBatch();
     void maybeLogPerformanceTelemetry(std::chrono::steady_clock::time_point now);
 
     bool ensureRpcTransport();
@@ -293,23 +286,9 @@ private:
     uint64_t imported_block_count_ = 0;
     int32_t blocks_per_second_ = 20;
     std::atomic<bool> suppress_command_feedback_{true};
-    // Normal, fully authorized imports retain their intentionally unpaced
-    // transport behavior. The limited pre-verification profile enables this
-    // runtime-only, no-catch-up pacing gate so its 500 blocks/s cap is real,
-    // not merely a UI value or a command-merge hint.
-    bool placement_rate_limiting_enabled_ = false;
     double available_block_tokens_ = 1.0;
     double available_command_tokens_ = 1.0;
     size_t max_batch_commands_ = 1;
-    struct LimitedSendRecord {
-        std::chrono::steady_clock::time_point sent_at{};
-        uint64_t block_count = 0;
-    };
-    // The token bucket bounds scheduling jitter, while this ledger is the
-    // authoritative cap for the restricted profile: only blocks actually sent
-    // during the trailing second count against its configured rate.
-    std::deque<LimitedSendRecord> limited_send_history_;
-    uint64_t limited_window_blocks_ = 0;
     BuildImportThroughputGovernor throughput_governor_{20};
     uint64_t unbarriered_command_count_ = 0;
     uint64_t unbarriered_block_count_ = 0;
@@ -321,8 +300,6 @@ private:
     std::chrono::steady_clock::time_point pipelined_barrier_sent_at_{};
     std::chrono::steady_clock::time_point pipelined_barrier_poll_at_{};
     std::chrono::steady_clock::time_point pipelined_barrier_deadline_{};
-    std::chrono::steady_clock::time_point last_tick_{};
-    std::chrono::steady_clock::time_point last_rate_refill_{};
     std::chrono::steady_clock::time_point active_unit_last_send_at_{};
     std::chrono::steady_clock::time_point phase_settle_ready_at_{};
     std::chrono::milliseconds pending_resume_settle_delay_{0};
@@ -439,10 +416,7 @@ private:
     bool verification_repair_phase_dirty_ = false;
     std::chrono::steady_clock::time_point verification_repair_settle_ready_at_{};
     std::unique_ptr<CommandSpoolReader> verification_repair_reader_;
-    // A repair reader is intentionally not advanced past a command that does
-    // not fit the current rolling-window remainder.  Keeping that command in
-    // memory avoids both a rate violation and a lost replay record.
-    std::optional<PlannedCommand> verification_repair_pending_command_;
+    // Repair only the chunks selected by the verification pass.
     std::set<ChunkCoord> verification_repair_reader_chunk_filter_;
 
     // Deferred command-block payloads are stored separately from the fill

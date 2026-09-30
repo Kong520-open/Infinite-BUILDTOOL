@@ -8,7 +8,6 @@
 #if defined(__ANDROID__)
 #include "NativeWorldAccess.h"
 #include "../main.h"
-#include "../native_auth.h"
 #include "../tp/LoopbackPacketSenderCapture.h"
 #include "../tp/MinecraftUpdateHook.h"
 #endif
@@ -122,7 +121,7 @@ bool readNativeObservation(void*, const MapChestWindowRequest& request,
                            std::string* error) {
     if (!output) return fail(error, "map chest observation output is unavailable");
     *output = {};
-    if (!IsNativeSessionAuthorized() || !IsMinecraftUpdateGameThread()) {
+    if (!IsMinecraftUpdateGameThread()) {
         return fail(error, "map chest preflight requires an authorized game tick");
     }
     output->authorized_game_tick = true;
@@ -186,7 +185,7 @@ bool ReadVerifiedMapNativePlayerBlockPosition(
     *y = 0;
     *z = 0;
 #if defined(__ANDROID__)
-    if (!IsNativeSessionAuthorized() || !IsMinecraftUpdateGameThread()) {
+    if (!IsMinecraftUpdateGameThread()) {
         return fail(error, "native player position requires an authorized game tick");
     }
     return readPlayerPosition(x, y, z, error);

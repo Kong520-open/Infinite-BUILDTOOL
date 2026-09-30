@@ -1,4 +1,4 @@
-#include "LightningEffect.h"
+#include "BuildPacketReceiveHook.h"
 
 #include "../build_import/BuildImportRuntime.h"
 #include "../build_import/ContainerCaptureMailbox.h"
@@ -15,7 +15,6 @@
 #include "../build_import/ProjectionPrinterNativeHotbarSelection.h"
 #include "../build_import/SignEditSessionMailbox.h"
 #include "../log_control.h"
-#include "../native_auth.h"
 #include "FunctionsAddress.h"
 #include "MinecraftUpdateHook.h"
 #include "dobby.h"
@@ -46,7 +45,7 @@ bool tryDeliverProjectionPrinterClientSync(void* connection, void* networkSystem
         // Only the first-argument instance that delivered the printer's
         // matched ContainerOpen may drain its client-bound slot updates.
         // The third argument remains scratch state, never an identity gate.
-        if (!IsNativeSessionAuthorized() || !connection) {
+        if (!connection) {
             return false;
         }
         build_import::ProjectionPrinterInventoryClientSyncQueuedPacket queued;
@@ -83,7 +82,7 @@ bool tryDeliverProjectionPrinterClientSync(void* connection, void* networkSystem
 
 bool tryDeliverMapAnvilClientSync(void* connection, std::string& packet) noexcept {
     try {
-        if (!IsNativeSessionAuthorized() || !connection) return false;
+        if (!connection) return false;
         build_import::MapAnvilClientSyncQueuedPacket queued;
         if (!build_import::TakeMapAnvilClientSyncPacket(connection, &queued)) {
             return false;
@@ -115,7 +114,7 @@ bool tryDeliverMapAnvilClientSync(void* connection, std::string& packet) noexcep
 
 bool tryDeliverMapChestClientSync(void* connection, std::string& packet) noexcept {
     try {
-        if (!IsNativeSessionAuthorized() || !connection) return false;
+        if (!connection) return false;
         build_import::MapChestClientSyncQueuedPacket queued;
         if (!build_import::TakeMapChestClientSyncPacket(connection, &queued)) {
             return false;
@@ -169,7 +168,7 @@ int HookReceivePacket(void* connection, std::string& packet, void* networkSystem
              static_cast<unsigned long long>(callIndex), result, packet.size());
     }
 
-    if (IsNativeSessionAuthorized() && result == 0) {
+    if (result == 0) {
         size_t suppressedCount = 0U;
         for (;;) {
             // Diagnostic only: inspect manual chest traffic before the
@@ -252,7 +251,7 @@ int HookReceivePacket(void* connection, std::string& packet, void* networkSystem
             const bool suppressSign =
                 build_import::ObserveSignEditSessionPacket(packet);
             if (!suppressPrinterOpen && !suppressContainer && !suppressSign &&
-                !ObserveTeleportPermissionProbePacket(packet) &&
+                !ObserveBuildExportTeleportPacket(packet) &&
                 !build_import::BuildImportRuntime::instance().onRawNetworkPacket(packet)) {
                 break;
             }
@@ -276,7 +275,7 @@ int HookReceivePacket(void* connection, std::string& packet, void* networkSystem
 
 }  // namespace
 
-bool LightningEffect::init(uintptr_t baseAddress) {
+bool BuildPacketReceiveHook::init(uintptr_t baseAddress) {
     if (baseAddress == 0) return false;
 
     std::lock_guard<std::mutex> installLock(g_hookInstallMutex);
@@ -306,19 +305,7 @@ bool LightningEffect::init(uintptr_t baseAddress) {
     return isReceiveHookReady();
 }
 
-bool LightningEffect::isReceiveHookReady() {
+bool BuildPacketReceiveHook::isReceiveHookReady() {
     return g_receiveHookInstalled.load(std::memory_order_acquire) &&
         g_originalReceivePacket != nullptr;
-}
-
-void LightningEffect::revoke() noexcept {
-    build_import::ClearMapAnvilDebugBridge();
-    build_import::ClearVisibleAnvilServerCloseReceipt();
-    build_import::ClearItemRuntimeRegistry();
-    build_import::ClearMapTextureObservations();
-    build_import::ClearMapAnvilClientSync();
-    build_import::ClearMapChestClientSync();
-    build_import::ClearProjectionPrinterInventoryClientSync();
-    build_import::ClearProjectionPrinterInventoryMailbox();
-    build_import::ClearProjectionPrinterNativeHotbarSelection();
 }

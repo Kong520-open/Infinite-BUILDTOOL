@@ -1,6 +1,6 @@
 #include "TpModule.h"
 #include "MinecraftUpdateHook.h"
-#include "LightningEffect.h"
+#include "BuildPacketReceiveHook.h"
 #include "../build_import/BuildExportRuntime.h"
 #include "../build_import/BuildImportRuntime.h"
 #include "../build_import/BuildProjectionRuntime.h"
@@ -24,10 +24,6 @@
 #include <vector>
 
 #define LOG_TAG "TInfinitecz_C_pModule"
-
-JavaVM* TpModule::javaVM = nullptr;
-std::string TpModule::worldId = "unknown";
-static std::mutex g_worldIdMutex;
 
 static std::string jstringToStdString(JNIEnv* env, jstring value) {
     if (!value) return {};
@@ -86,18 +82,6 @@ constexpr int32_t kBuildExportFailedState = 6;
 
 std::mutex g_buildOperationAdmissionMutex;
 
-bool requireFullBuildToolsAuthorization(const char* operation) {
-    (void)operation;
-    return true;
-}
-
-bool requireBuildImportAccess(const char* operation,
-                               build_import::BuildToolsAccessProfile* access_profile) {
-    if (!access_profile) return false;
-    *access_profile = build_import::BuildToolsAccessProfile::Full;
-    return true;
-}
-
 bool requireNoActiveBuildExport(const char* operation) {
     const int32_t state = static_cast<int32_t>(
         build_import::BuildExportRuntime::instance().state());
@@ -115,8 +99,8 @@ bool requireNoActiveBuildExport(const char* operation) {
 
 bool requireBuildImportReceiveHook(const char* operation) {
     const uintptr_t base_address = Main::getBaseAddress();
-    const bool ready = LightningEffect::isReceiveHookReady() ||
-        (base_address != 0 && LightningEffect::init(base_address));
+    const bool ready = BuildPacketReceiveHook::isReceiveHookReady() ||
+        (base_address != 0 && BuildPacketReceiveHook::init(base_address));
     LOGI("[import-preflight] operation=%s receive_hook_ready=%d base_ready=%d",
          operation, ready ? 1 : 0, base_address != 0 ? 1 : 0);
     if (!ready) {
@@ -268,18 +252,6 @@ std::string projectionMaterialSummaryWireError(const char* status) {
 
 }  // namespace
 
-void TpModule::setJavaVM(JavaVM* vm) {
-    javaVM = vm;
-}
-
-void TpModule::updateWorldId(const std::string& id) {
-    std::lock_guard<std::mutex> lock(g_worldIdMutex);
-    if (!id.empty() && id != "unknown" && id != worldId) {
-        worldId = id;
-        LOGI("★ 世界 ID 更新: %s", worldId.c_str());
-    }
-}
-
 // ==================== JNI 函数实现 ====================
 
 extern "C" JNIEXPORT jstring JNICALL Java_com_vdl_kong520_TpModule_getWorldId(JNIEnv* env, jclass) {
@@ -288,7 +260,6 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_vdl_kong520_TpModule_getWorldId(JN
         LOGE("getWorldId: game-thread client API query timed out or returned no world");
         wid = "unknown";
     }
-    TpModule::updateWorldId(wid);
     return env->NewStringUTF(wid.c_str());
 }
 
@@ -310,10 +281,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startBuildIm
         jboolean placeDenyLayer, jboolean verifyAfterImport, jint verificationPrecision,
         jint simulationChunkRange, jstring worldId, jint dimensionId,
         jboolean) try {
-    build_import::BuildToolsAccessProfile access_profile;
-    if (!requireBuildImportAccess("startBuildImport", &access_profile)) {
-        return JNI_FALSE;
-    }
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildExport("startBuildImport")) return JNI_FALSE;
     if (verificationPrecision < static_cast<jint>(build_import::VerificationPrecision::Fast) ||
@@ -332,12 +299,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startBuildIm
     // changes are preserved instead of being inferred from compressed audio.
     if (hasFileExtension(request.parse.source_path, ".mp3")) {
         LOGE("startBuildImport rejected removed MP3 command-music source");
-        return JNI_FALSE;
-    }
-    if (build_import::isLimitedBuildToolsImport(access_profile) &&
-        !hasFileExtension(request.parse.source_path, ".schem") &&
-        !hasFileExtension(request.parse.source_path, ".schematic")) {
-        LOGE("startBuildImport denied: limited access accepts only .schem/.schematic");
         return JNI_FALSE;
     }
     request.source_type = (hasFileExtension(request.parse.source_path, ".mid") ||
@@ -366,7 +327,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startBuildIm
                                                     : build_import::OverwritePolicy::PreserveExisting;
     request.config.place_deny_layer = placeDenyLayer == JNI_TRUE;
     request.config.blocks_per_second = blocksPerSecond;
-    request.config.access_profile = access_profile;
     // The UI expresses this setting in native Minecraft chunks.  Parse on the
     // same 16-block grid so values such as 5 or 7 do not get rounded up by the
     // former 32-block logical partition size.
@@ -397,9 +357,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startPixelAr
         jboolean placeDenyLayer, jboolean verifyAfterImport, jint verificationPrecision,
         jint simulationChunkRange, jstring worldId, jint dimensionId,
         jboolean createMapsAfterImport, jboolean) try {
-    if (!requireFullBuildToolsAuthorization("startPixelArtImport")) {
-        return JNI_FALSE;
-    }
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildExport("startPixelArtImport")) return JNI_FALSE;
     if (verificationPrecision < static_cast<jint>(build_import::VerificationPrecision::Fast) ||
@@ -429,7 +386,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startPixelAr
                                                     : build_import::OverwritePolicy::PreserveExisting;
     request.config.place_deny_layer = placeDenyLayer == JNI_TRUE;
     request.config.blocks_per_second = blocksPerSecond;
-    request.config.access_profile = build_import::BuildToolsAccessProfile::Full;
     request.config.chunk_size = build_import::ImportConfig::kVanillaChunkSize;
     request.config.simulation_chunk_range = simulationChunkRange;
     request.pixel_art.chunk_size = request.config.chunk_size;
@@ -453,17 +409,13 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startPixelAr
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_restoreBuildImport(
         JNIEnv* env, jclass, jstring spoolDirectory, jstring worldId, jint dimensionId) try {
-    build_import::BuildToolsAccessProfile access_profile;
-    if (!requireBuildImportAccess("restoreBuildImport", &access_profile)) {
-        return JNI_FALSE;
-    }
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildExport("restoreBuildImport")) return JNI_FALSE;
     if (!requireBuildImportReceiveHook("restoreBuildImport")) return JNI_FALSE;
     std::string error;
     const bool ok = build_import::BuildImportRuntime::instance().restore(
             jstringToStdString(env, spoolDirectory), {jstringToStdString(env, worldId), dimensionId},
-            access_profile, &error);
+            &error);
     if (!ok) LOGE("restoreBuildImport failed: %s", error.c_str());
     return ok ? JNI_TRUE : JNI_FALSE;
 } catch (const std::exception& exception) {
@@ -477,9 +429,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_restoreBuild
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_undoLastBuildImport(
         JNIEnv* env, jclass, jstring storageDirectory, jstring spoolDirectory,
         jstring worldId, jint dimensionId) try {
-    if (!requireFullBuildToolsAuthorization("undoLastBuildImport")) {
-        return JNI_FALSE;
-    }
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildExport("undoLastBuildImport") ||
         !requireNoActiveBuildImport("undoLastBuildImport")) {
@@ -503,9 +452,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_undoLastBuil
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_discardBuildImportUndoClaim(
         JNIEnv* env, jclass, jstring storageDirectory, jstring spoolDirectory) try {
-    if (!requireFullBuildToolsAuthorization("discardBuildImportUndoClaim")) {
-        return JNI_FALSE;
-    }
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildExport("discardBuildImportUndoClaim") ||
         !requireNoActiveBuildImport("discardBuildImportUndoClaim")) {
@@ -535,16 +481,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_pauseBuildImport
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_resumeBuildImport(
         JNIEnv* env, jclass, jstring worldId, jint dimensionId) try {
-    build_import::BuildToolsAccessProfile access_profile;
-    if (!requireBuildImportAccess("resumeBuildImport", &access_profile)) {
-        return JNI_FALSE;
-    }
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildExport("resumeBuildImport")) return JNI_FALSE;
     if (!requireBuildImportReceiveHook("resumeBuildImport")) return JNI_FALSE;
     std::string error;
     const bool ok = build_import::BuildImportRuntime::instance().resume(
-            {jstringToStdString(env, worldId), dimensionId}, access_profile, &error);
+            {jstringToStdString(env, worldId), dimensionId}, &error);
     if (!ok) LOGE("resumeBuildImport failed: %s", error.c_str());
     return ok ? JNI_TRUE : JNI_FALSE;
 } catch (const std::exception& exception) {
@@ -606,7 +548,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_vdl_kong520_TpModule_getBuildImportI
 
 extern "C" JNIEXPORT jintArray JNICALL Java_com_vdl_kong520_TpModule_getBuildExportPlayerBlockPosition(
         JNIEnv* env, jclass) try {
-    if (!env || !requireFullBuildToolsAuthorization("getBuildExportPlayerBlockPosition")) {
+    if (!env) {
         return nullptr;
     }
     int32_t x = 0;
@@ -675,7 +617,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startBuildEx
         jint teleportMode, jstring worldId, jint dimensionId,
         jboolean replaceCheckpoint, jint simulationChunkRange,
         jboolean exportContainerItems) try {
-    if (!requireFullBuildToolsAuthorization("startBuildExport")) return JNI_FALSE;
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildImport("startBuildExport")) return JNI_FALSE;
     if (!build_import::isValidSimulationChunkRange(simulationChunkRange)) {
@@ -697,7 +638,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startBuildEx
     request.second_z = secondZ;
     request.travel_mode = static_cast<build_import::BuildExportTravelMode>(teleportMode);
     if (request.travel_mode == build_import::BuildExportTravelMode::Disabled) {
-        InvalidateTeleportCommandPermission();
+        CancelBuildExportTeleport();
     } else if (request.travel_mode == build_import::BuildExportTravelMode::Automatic) {
         LOGI("startBuildExport: automatic teleport requested; first region will verify "
              "TP from the observed local-player position");
@@ -724,7 +665,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_startBuildEx
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_hasBuildExportCheckpoint(
         JNIEnv* env, jclass, jstring outputPath) try {
-    if (!requireFullBuildToolsAuthorization("hasBuildExportCheckpoint")) return JNI_FALSE;
     return build_import::BuildExportRuntime::instance().hasCheckpoint(
         jstringToStdString(env, outputPath)) ? JNI_TRUE : JNI_FALSE;
 } catch (const std::exception& exception) {
@@ -738,7 +678,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_hasBuildExpo
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_resumeBuildExport(
         JNIEnv* env, jclass, jstring outputPath, jint teleportMode,
         jstring worldId, jint dimensionId) try {
-    if (!requireFullBuildToolsAuthorization("resumeBuildExport")) return JNI_FALSE;
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     if (!requireNoActiveBuildImport("resumeBuildExport")) return JNI_FALSE;
     std::string error;
@@ -748,7 +687,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_resumeBuildE
     }
     const auto travel_mode = static_cast<build_import::BuildExportTravelMode>(teleportMode);
     if (travel_mode == build_import::BuildExportTravelMode::Disabled) {
-        InvalidateTeleportCommandPermission();
+        CancelBuildExportTeleport();
     } else if (travel_mode == build_import::BuildExportTravelMode::Automatic) {
         LOGI("resumeBuildExport: automatic teleport requested; first restored region will verify "
              "TP from the observed local-player position");
@@ -770,7 +709,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_resumeBuildE
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_discardBuildExportCheckpoint(
         JNIEnv* env, jclass, jstring outputPath) try {
-    if (!requireFullBuildToolsAuthorization("discardBuildExportCheckpoint")) return JNI_FALSE;
     std::lock_guard<std::mutex> admission_lock(g_buildOperationAdmissionMutex);
     std::string error;
     const bool ok = build_import::BuildExportRuntime::instance().discardCheckpoint(
@@ -866,9 +804,6 @@ extern "C" JNIEXPORT jint JNICALL Java_com_vdl_kong520_TpModule_getBuildExportTe
 
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_requestBuildExportNextRegion(
         JNIEnv*, jclass) try {
-    if (!requireFullBuildToolsAuthorization("requestBuildExportNextRegion")) {
-        return JNI_FALSE;
-    }
     return build_import::BuildExportRuntime::instance().requestNextRegionTeleport()
         ? JNI_TRUE : JNI_FALSE;
 } catch (const std::exception& exception) {
@@ -881,7 +816,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_requestBuild
 
 extern "C" JNIEXPORT jintArray JNICALL Java_com_vdl_kong520_TpModule_getBuildExportTravelTarget(
         JNIEnv* env, jclass) try {
-    if (!env || !requireFullBuildToolsAuthorization("getBuildExportTravelTarget")) {
+    if (!env) {
         return nullptr;
     }
     build_import::BuildExportTravelTarget target;
@@ -915,11 +850,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_loadBuildPro
         JNIEnv* env, jclass, jstring sourcePath, jstring workDirectory,
         jint baseX, jint baseY, jint baseZ, jint rotationDegrees,
         jint pixelArtWidth) try {
-    if (!requireFullBuildToolsAuthorization("loadBuildProjection")) {
-        return JNI_FALSE;
-    }
     if (!requireNoActiveBuildExport("loadBuildProjection")) return JNI_FALSE;
-    // Hook initialization normally happens immediately after verification.
+    // Ensure the game hooks are ready before loading a projection.
     // Retry here so a transient early-loading failure cannot leave a valid
     // projection permanently invisible for the rest of the process.
     if (!EnsureBuildProjectionHooksReady()) {
@@ -978,10 +910,6 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_vdl_kong520_TpModule_getBuildProjectionMaterialSummaryPage(
         JNIEnv* env, jclass, jint pageIndex, jint pageSize) try {
     if (!env) return nullptr;
-    if (!requireFullBuildToolsAuthorization("getBuildProjectionMaterialSummaryPage")) {
-        const std::string response = projectionMaterialSummaryWireError("unavailable");
-        return env->NewStringUTF(response.c_str());
-    }
     if (pageIndex < 0 || pageSize <= 0 ||
         pageSize > kMaximumProjectionMaterialPreviewPageEntries) {
         const std::string response = projectionMaterialSummaryWireError("invalid");
@@ -1023,7 +951,6 @@ Java_com_vdl_kong520_TpModule_getBuildProjectionMaterialSummaryPage(
 extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjectionEnabled(
         JNIEnv*, jclass, jboolean enabled) {
     const bool requested = enabled == JNI_TRUE;
-    if (requested && !requireFullBuildToolsAuthorization("setBuildProjectionEnabled")) return;
     build_import::BuildProjectionRenderer::instance().setEnabled(requested);
     // Printing is defined by the current rendered projection scope. Hiding
     // that projection also stops its printer rather than leaving an invisible
@@ -1034,9 +961,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjecti
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_setBuildProjectionOutlineEnabled(
         JNIEnv*, jclass, jboolean enabled) {
     const bool requested = enabled == JNI_TRUE;
-    if (requested && !requireFullBuildToolsAuthorization("setBuildProjectionOutlineEnabled")) {
-        return JNI_FALSE;
-    }
     const bool applied =
         build_import::BuildProjectionRenderer::instance().setOutlineEnabled(requested);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
@@ -1047,20 +971,17 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_setBuildProj
 
 extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjectionAlpha(
         JNIEnv*, jclass, jfloat alpha) {
-    if (!requireFullBuildToolsAuthorization("setBuildProjectionAlpha")) return;
     build_import::BuildProjectionRenderer::instance().setFillAlpha(alpha);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjectionRange(
         JNIEnv*, jclass, jint rangeChunks) {
-    if (!requireFullBuildToolsAuthorization("setBuildProjectionRange")) return;
     build_import::BuildProjectionRenderer::instance().setRangeChunks(rangeChunks);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjectionLayerFilter(
         JNIEnv*, jclass, jint mode, jboolean worldSpace,
         jint minimumY, jint maximumY) try {
-    if (!requireFullBuildToolsAuthorization("setBuildProjectionLayerFilter")) return;
     build_import::ProjectionLayerFilter filter;
     const int bounded_mode = std::max(0, std::min(4, static_cast<int>(mode)));
     filter.mode = static_cast<build_import::ProjectionLayerMode>(bounded_mode);
@@ -1085,9 +1006,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjecti
 extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjectionPrinterEnabled(
         JNIEnv*, jclass, jboolean enabled) try {
     const bool requested = enabled == JNI_TRUE;
-    if (requested && !requireFullBuildToolsAuthorization("setBuildProjectionPrinterEnabled")) {
-        return;
-    }
     build_import::ProjectionPrinterRuntime::instance().setEnabled(requested);
 } catch (const std::exception& exception) {
     LOGE("setBuildProjectionPrinterEnabled C++ exception: %s", exception.what());
@@ -1099,10 +1017,6 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_vdl_kong520_TpModule_setBuildProjectionReachabilityPreviewEnabled(
         JNIEnv*, jclass, jboolean enabled) try {
     const bool requested = enabled == JNI_TRUE;
-    if (requested &&
-        !requireFullBuildToolsAuthorization("setBuildProjectionReachabilityPreviewEnabled")) {
-        return;
-    }
     build_import::ProjectionPrinterRuntime::instance().setReachabilityPreviewEnabled(requested);
 } catch (const std::exception& exception) {
     LOGE("setBuildProjectionReachabilityPreviewEnabled C++ exception: %s", exception.what());
@@ -1123,7 +1037,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_isBuildProje
 
 extern "C" JNIEXPORT void JNICALL Java_com_vdl_kong520_TpModule_setBuildProjectionPrinterRate(
         JNIEnv*, jclass, jint blocksPerSecond) try {
-    if (!requireFullBuildToolsAuthorization("setBuildProjectionPrinterRate")) return;
     build_import::ProjectionPrinterRuntime::instance().setRate(static_cast<int32_t>(blocksPerSecond));
 } catch (const std::exception& exception) {
     LOGE("setBuildProjectionPrinterRate C++ exception: %s", exception.what());
@@ -1205,9 +1118,6 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_vdl_kong520_TpModule_getBuildProje
         LOGE("getBuildProjectionTextureRequests rejected null JNIEnv");
         return nullptr;
     }
-    if (!requireFullBuildToolsAuthorization("getBuildProjectionTextureRequests")) {
-        return env->NewStringUTF("");
-    }
     const std::vector<build_import::ProjectionMaterialRequest> requests =
         build_import::BuildProjectionRenderer::instance().textureMaterialRequests();
     std::string output;
@@ -1239,9 +1149,6 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_vdl_kong520_TpModule_getBuildProje
 extern "C" JNIEXPORT jboolean JNICALL Java_com_vdl_kong520_TpModule_installBuildProjectionTexturePack(
         JNIEnv* env, jclass, jobjectArray materialKeys, jshortArray faceLayers,
         jint tileSize, jint layerCount, jbyteArray layerPixels) try {
-    if (!requireFullBuildToolsAuthorization("installBuildProjectionTexturePack")) {
-        return JNI_FALSE;
-    }
     if (!env || !materialKeys || !faceLayers || !layerPixels) {
         LOGE("installBuildProjectionTexturePack rejected null argument");
         return JNI_FALSE;

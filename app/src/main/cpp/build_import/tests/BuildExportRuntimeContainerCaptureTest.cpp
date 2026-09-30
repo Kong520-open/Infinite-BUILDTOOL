@@ -10,7 +10,7 @@
 #include "../ItemRuntimeRegistry.h"
 #include "../SchematicWriter.h"
 #include "../../main.h"
-#include "../../tp/LightningEffect.h"
+#include "../../tp/BuildPacketReceiveHook.h"
 #include "../../tp/MinecraftUpdateHook.h"
 
 #include <cassert>
@@ -333,14 +333,14 @@ bool ContainerClosePacketSender::send(uint8_t container_id,
 
 }  // namespace build_import
 
-bool LightningEffect::init(uintptr_t base_address) {
+bool BuildPacketReceiveHook::init(uintptr_t base_address) {
     assert(base_address == kFakeMinecraftBase);
     ++g_receive_hook_init_calls;
     if (g_receive_hook_init_succeeds) g_receive_hook_ready = true;
     return g_receive_hook_ready;
 }
 
-bool LightningEffect::isReceiveHookReady() {
+bool BuildPacketReceiveHook::isReceiveHookReady() {
     return g_receive_hook_ready;
 }
 
@@ -348,15 +348,15 @@ uintptr_t GetCachedDimensionTokenForWorld(const std::string&) {
     return 0U;
 }
 
-bool RequestTeleport(float, float, float) {
+bool RequestBuildExportTeleport(float, float, float) {
     return false;
 }
 
-bool IsTeleportPermissionProbePending() {
+bool IsBuildExportTeleportPending() {
     return false;
 }
 
-void CancelPendingTeleportRequest() {}
+void CancelBuildExportTeleport() {}
 
 namespace {
 

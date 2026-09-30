@@ -9,7 +9,6 @@
 #include "PixelArtParser.h"
 #include "ProjectionBlockIdentity.h"
 #include "SchematicParser.h"
-#include "../native_auth.h"
 
 #include <algorithm>
 #include <array>
@@ -2621,19 +2620,9 @@ void BuildProjectionRuntime::startLazySurfaceWorker(
 void BuildProjectionRuntime::runLazySurfaceWorker(
         std::shared_ptr<LazyProjectionSource> source) noexcept {
     if (!source) return;
-    bool authorization_valid = true;
-    auto next_authorization_check = std::chrono::steady_clock::time_point{};
     const auto cancelled = [&]() {
-        if (source->stop_requested.load(std::memory_order_acquire) ||
-            source->generation != generation_.load(std::memory_order_acquire)) {
-            return true;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= next_authorization_check) {
-            authorization_valid = IsBuildToolsAuthorized();
-            next_authorization_check = now + std::chrono::milliseconds(250);
-        }
-        return !authorization_valid;
+        return source->stop_requested.load(std::memory_order_acquire) ||
+            source->generation != generation_.load(std::memory_order_acquire);
     };
     const auto detachCompletedSource = [&]() {
         std::lock_guard<std::mutex> lock(lazy_worker_mutex_);
@@ -2938,16 +2927,8 @@ bool BuildProjectionRuntime::load(BuildProjectionLoadRequest request, std::strin
     // a worker just as a newer request is queued.
     stopLazySurfaceWorker();
     clearPrinterSource();
-    bool authorization_valid = true;
-    auto next_authorization_check = std::chrono::steady_clock::time_point{};
     const auto cancelled = [&]() {
-        if (generation != generation_.load(std::memory_order_acquire)) return true;
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= next_authorization_check) {
-            authorization_valid = IsBuildToolsAuthorized();
-            next_authorization_check = now + std::chrono::milliseconds(250);
-        }
-        return !authorization_valid;
+        return generation != generation_.load(std::memory_order_acquire);
     };
     try {
     if (cancelled()) {

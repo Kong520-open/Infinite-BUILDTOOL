@@ -4,6 +4,8 @@ An Android building tools project for Xposed/LSPosed, providing in-game structur
 
 See the [project overview](BUILDTOOL项目实现功能总览.md) for details of the current implementation.
 
+The native `tp/` directory provides building tool JNI interfaces, game tick scheduling, world queries, and packet/Python bridges. Export can request movement between capture regions using the server's `/tp` command; this requires the appropriate permissions and is confirmed from the player's actual position.
+
 ## Usage Guidelines
 
 This tool is intended solely for building assistance and creative projects. It does not include features designed to attack or harass other players, or maliciously disrupt normal gameplay. Use it with respect for other players' experience and follow the rules of the world or server you are playing on.

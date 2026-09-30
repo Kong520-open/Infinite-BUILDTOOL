@@ -122,8 +122,7 @@ public:
                            std::string* error = nullptr);
     void onGameTick();
     // Refreshes only the cached local-player position used by UI corner/anchor
-    // capture.  It never advances an export state machine and is safe to call
-    // for the limited, import-only building-tools profile.
+    // capture. It never advances the export state machine.
     void refreshPlayerPositionCache();
     // Requests a game-thread refresh and waits only for the shared cache.  This
     // keeps JNI callers off the Python/world path while making a first position

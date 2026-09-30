@@ -9,7 +9,6 @@
 #if defined(__ANDROID__)
 #include "NativeWorldAccess.h"
 #include "../main.h"
-#include "../native_auth.h"
 #include "../tp/LoopbackPacketSenderCapture.h"
 #include "../tp/MinecraftUpdateHook.h"
 #endif
@@ -137,7 +136,7 @@ bool readNativeObservation(
         std::string* error) {
     if (!output) return fail(error, "anvil preflight observation output is unavailable");
     *output = {};
-    if (!IsNativeSessionAuthorized() || !IsMinecraftUpdateGameThread()) {
+    if (!IsMinecraftUpdateGameThread()) {
         return fail(error, "anvil preflight requires an authorized game tick");
     }
     output->authorized_game_tick = true;

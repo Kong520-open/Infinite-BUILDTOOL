@@ -1,14 +1,8 @@
 #include "../BuildProjectionRenderer.h"
 #include "../InfiniteczBuildParser.h"
-#include "../../native_auth.h"
 
 #include <algorithm>
 #include <cmath>
-
-// The partition self-test does not parse files or exercise authorization.
-bool IsBuildToolsAuthorized() {
-    return true;
-}
 
 namespace build_import {
 

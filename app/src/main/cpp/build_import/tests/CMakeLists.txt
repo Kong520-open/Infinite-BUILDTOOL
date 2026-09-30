@@ -733,6 +733,7 @@ add_executable(
     BuildProjectionPartitionTest.cpp
     BuildProjectionRendererStub.cpp
     ${BUILD_IMPORT_DIRECTORY}/BuildProjectionRuntime.cpp
+    ${BUILD_IMPORT_DIRECTORY}/ProjectionBlockIdentity.cpp
     ${BUILD_IMPORT_DIRECTORY}/BlockMapper.cpp
     ${BUILD_IMPORT_DIRECTORY}/ChunkSpoolWriter.cpp
     ${BUILD_IMPORT_DIRECTORY}/CommandSpool.cpp
