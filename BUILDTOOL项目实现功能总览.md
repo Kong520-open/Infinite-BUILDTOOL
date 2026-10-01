@@ -57,4 +57,4 @@ Debug APK 输出到 `app/build/outputs/apk/debug/`；Release 构建输出未签�
 
 ## 许可证
 
-项目自有代码采用根目录 `LICENSE` 中的 MIT 许可。随项目包含的第三方代码和库遵循各自的许可证。
+项目自有代码采用根目录 `LICENSE` 中的 PolyForm Noncommercial License 1.0.0。你可以在非商业用途下使用、修改和再分发本项目；商业用途需要获得版权持有者的单独许可。随项目包含的第三方代码和库遵循各自的许可证，根目录许可不会替代它们。

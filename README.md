@@ -18,5 +18,6 @@ This project is developed and maintained almost entirely with AI assistance. Its
 
 ## License
 
-Project-owned code is licensed under the [MIT License](LICENSE).
-Third-party code and libraries remain subject to their respective licenses; the root MIT license does not replace them.
+Project-owned code is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+You may use, modify, and redistribute the project for non-commercial purposes only. Commercial use requires separate permission from the copyright holder.
+Third-party code and libraries remain subject to their respective licenses; the root license does not replace them.
