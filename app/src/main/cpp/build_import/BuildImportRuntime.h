@@ -438,6 +438,8 @@ private:
     int32_t command_block_cell_z_ = 0;
     uint32_t command_block_cell_load_retries_ = 0;
     uint32_t command_block_target_retries_ = 0;
+    bool command_block_cell_target_verified_ = false;
+    bool command_block_cell_window_reused_ = false;
     std::chrono::steady_clock::time_point command_block_cell_ready_at_{};
     std::chrono::steady_clock::time_point command_block_cell_deadline_{};
     bool command_block_writer_active_ = false;

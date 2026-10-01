@@ -136,10 +136,30 @@ bool CommandBlockPacketSender::send(const CommandBlockRecord& record, std::strin
     if (!module_base) {
         return fail(error, "libminecraftpe.so is not loaded");
     }
-    uintptr_t constructor_address = 0;
-    uintptr_t sender_address = 0;
-    const CommandBlockPacketAbiProfile* const profile =
-        findPacketProfile(module_base, &constructor_address, &sender_address);
+    // Profile/RVA resolution walks executable memory and was previously done
+    // for every packet. Command-block delivery is already restricted to the
+    // game thread, so retain the verified addresses for the current module
+    // image and invalidate them automatically after a process/image change.
+    struct CachedAbi {
+        uintptr_t module_base = 0;
+        const CommandBlockPacketAbiProfile* profile = nullptr;
+        uintptr_t constructor_address = 0;
+        uintptr_t sender_address = 0;
+    };
+    static CachedAbi cached;
+    if (cached.module_base != module_base || !cached.profile) {
+        uintptr_t constructor_address = 0;
+        uintptr_t sender_address = 0;
+        const CommandBlockPacketAbiProfile* const resolved_profile =
+            findPacketProfile(module_base, &constructor_address, &sender_address);
+        if (resolved_profile) {
+            cached = {module_base, resolved_profile, constructor_address, sender_address};
+        }
+    }
+    const CommandBlockPacketAbiProfile* const profile = cached.module_base == module_base
+        ? cached.profile : nullptr;
+    const uintptr_t constructor_address = cached.constructor_address;
+    const uintptr_t sender_address = cached.sender_address;
     if (!profile) {
         return fail(error, "CommandBlockUpdatePacket ABI profile does not match this game version");
     }

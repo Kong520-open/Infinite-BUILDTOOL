@@ -292,6 +292,16 @@ constexpr uint32_t kCommandBlockTargetRetryLimit = 3;
 // command setup materially closer to the configured building speed.
 constexpr uint32_t kCommandBlockWritesPerTick = 768;
 constexpr auto kCommandBlockWriteTickBudget = std::chrono::milliseconds(10);
+constexpr uint32_t kGameTicksPerSecond = 20;
+
+uint32_t commandBlockWritesPerTick(int32_t blocks_per_second) {
+    const uint64_t bounded_rate = static_cast<uint64_t>(std::max<int32_t>(
+        1, std::min<int32_t>(blocks_per_second, kMaximumBlocksPerSecond)));
+    const uint64_t per_tick =
+        (bounded_rate + kGameTicksPerSecond - 1U) / kGameTicksPerSecond;
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        kCommandBlockWritesPerTick, std::max<uint64_t>(1U, per_tick)));
+}
 constexpr int32_t kSignCellSpanBlocks = 16;
 constexpr auto kSignTargetSettleDelay = std::chrono::seconds(1);
 constexpr auto kSignEditSessionTimeout = std::chrono::seconds(2);
@@ -7422,6 +7432,8 @@ void BuildImportRuntime::resetCommandBlockRuntime() {
     command_block_cell_z_ = 0;
     command_block_cell_load_retries_ = 0;
     command_block_target_retries_ = 0;
+    command_block_cell_target_verified_ = false;
+    command_block_cell_window_reused_ = false;
     command_block_cell_ready_at_ = {};
     command_block_cell_deadline_ = {};
     command_block_writer_active_ = false;
@@ -7558,6 +7570,7 @@ bool BuildImportRuntime::beginCommandBlockCell(std::chrono::steady_clock::time_p
     }
     const bool reuse_loaded_window = loaded_region_.has_value() &&
         containsBounds(command_block_load_window_bounds_, command_block_cell_bounds_);
+    command_block_cell_window_reused_ = reuse_loaded_window;
     if (!reuse_loaded_window) {
         command_block_load_window_bounds_ = commandBlockLoadWindowBounds(cell_x, cell_y, cell_z);
         if (!command_block_load_window_bounds_.isValid()) {
@@ -7568,16 +7581,29 @@ bool BuildImportRuntime::beginCommandBlockCell(std::chrono::steady_clock::time_p
     if (different_cell) {
         command_block_cell_load_retries_ = 0;
         command_block_target_retries_ = 0;
+        command_block_cell_target_verified_ = false;
     }
     command_block_cell_ready_at_ = {};
     command_block_cell_deadline_ = {};
     command_block_world_reader_.reset();
     resetServerChunkProbe();
     if (!reuse_loaded_window) {
-        // A live verification cell may still own infinitecz_build. Defer the
-        // next add until its tracked removal has completed at the top of a
-        // later tick. Adjacent command-block cells keep their shared window.
-        releaseLoadedRegion(true);
+        // Command-block cells are independent editor targets. Send the prior
+        // area's idempotent removal immediately before preparing the next
+        // area; waiting for the general cleanup barrier here reduced delivery
+        // to a few records per second. Terminal and recovery paths still use
+        // the tracked cleanup barrier.
+        if (command_block_writer_active_ && !loaded_region_cleanup_command_.empty()) {
+            const std::vector<std::string> cleanup_commands{
+                loaded_region_cleanup_command_};
+            size_t sent_count = 0;
+            if (!executeCommands(cleanup_commands, &sent_count) ||
+                sent_count != cleanup_commands.size()) {
+                if (error) *error = "cannot remove previous command-block ticking area";
+                return false;
+            }
+        }
+        releaseLoadedRegion(false);
     }
     stage_ = ExecuteStage::CommandBlockPrepare;
     (void)now;
@@ -7591,6 +7617,12 @@ bool BuildImportRuntime::commandBlockCellReady(std::chrono::steady_clock::time_p
         return false;
     }
     if (now < command_block_cell_ready_at_) return false;
+    if (command_block_cell_window_reused_) {
+        if (command_block_pending_record_ &&
+            localPlayerIsNearCommandBlockRecord(*command_block_pending_record_)) return true;
+        if (error) *error = "local player has not arrived near the command-block target";
+        return false;
+    }
     std::string probe_error;
     const ChunkProbeState probe = pollServerChunkProbe(command_block_cell_bounds_, now,
                                                         &probe_error);
@@ -7671,6 +7703,7 @@ void BuildImportRuntime::tickCommandBlockWrite(std::chrono::steady_clock::time_p
         const int32_t teleport_z = target.z;
         const bool reuse_loaded_window = loaded_region_.has_value() &&
             containsBounds(command_block_load_window_bounds_, command_block_cell_bounds_);
+        command_block_cell_window_reused_ = reuse_loaded_window;
         if (!command_block_load_window_bounds_.isValid()) {
             pauseCommandBlockWrite("command-block load window is invalid");
             return;
@@ -7800,6 +7833,7 @@ void BuildImportRuntime::tickCommandBlockWrite(std::chrono::steady_clock::time_p
     }
 
     uint32_t sent = 0;
+    const uint32_t writes_per_tick = commandBlockWritesPerTick(blocks_per_second_);
     const auto write_deadline = std::chrono::steady_clock::now() +
         kCommandBlockWriteTickBudget;
     const auto persist_sent_burst = [&]() {
@@ -7813,7 +7847,7 @@ void BuildImportRuntime::tickCommandBlockWrite(std::chrono::steady_clock::time_p
             ? "cannot persist command-block cursor" : state_error);
         return false;
     };
-    while (command_block_pending_record_ && sent < kCommandBlockWritesPerTick &&
+    while (command_block_pending_record_ && sent < writes_per_tick &&
            std::chrono::steady_clock::now() < write_deadline &&
            sameCommandBlockCell(*command_block_pending_record_, command_block_cell_x_,
                                   command_block_cell_y_, command_block_cell_z_)) {
@@ -7827,34 +7861,37 @@ void BuildImportRuntime::tickCommandBlockWrite(std::chrono::steady_clock::time_p
             status_ = "repositioning near command-block target before data write";
             return;
         }
-        // A successful /fill/repair plan only proves that the command-block
-        // shell was scheduled. Before serializing its NBT packet, make sure
-        // the locally loaded target is still the expected shell. This prevents
-        // a delayed chunk, an overwrite collision, or a bad mapping from
-        // silently advancing the durable sidecar cursor against air/another
-        // block type.
-        std::string target_error;
-        if (!commandBlockTargetMatches(&command_block_world_reader_,
-                                       *command_block_pending_record_,
-                                       &target_error)) {
-            if (++command_block_target_retries_ <= kCommandBlockTargetRetryLimit) {
-                if (!persist_sent_burst()) return;
-                LOGI("[command-block] target retry=%u cell=(%d,%d,%d): %s",
-                     command_block_target_retries_, command_block_cell_x_,
-                     command_block_cell_y_, command_block_cell_z_, target_error.c_str());
-                resetServerChunkProbe();
-                command_block_world_reader_.reset();
-                releaseLoadedRegion(true);
-                stage_ = ExecuteStage::CommandBlockPrepare;
-                std::lock_guard<std::mutex> lock(mutex_);
-                status_ = "reloading command-block target before data write";
+        // The shell placement is already ordered before this deferred phase.
+        // Validate one target after the cell has loaded, then reuse that
+        // proof for the remaining records in the same cell. Reading every
+        // block through the native world ABI made the game-thread budget the
+        // effective rate limiter, so large command-block groups collapsed to
+        // only a few packets per second regardless of the configured speed.
+        if (!command_block_cell_target_verified_) {
+            std::string target_error;
+            if (!commandBlockTargetMatches(&command_block_world_reader_,
+                                           *command_block_pending_record_,
+                                           &target_error)) {
+                if (++command_block_target_retries_ <= kCommandBlockTargetRetryLimit) {
+                    if (!persist_sent_burst()) return;
+                    LOGI("[command-block] target retry=%u cell=(%d,%d,%d): %s",
+                         command_block_target_retries_, command_block_cell_x_,
+                         command_block_cell_y_, command_block_cell_z_, target_error.c_str());
+                    resetServerChunkProbe();
+                    command_block_world_reader_.reset();
+                    releaseLoadedRegion(true);
+                    stage_ = ExecuteStage::CommandBlockPrepare;
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_ = "reloading command-block target before data write";
+                    return;
+                }
+                pauseCommandBlockWrite(target_error.empty()
+                    ? "command-block target did not appear after retries" : target_error);
                 return;
             }
-            pauseCommandBlockWrite(target_error.empty()
-                ? "command-block target did not appear after retries" : target_error);
-            return;
+            command_block_target_retries_ = 0;
+            command_block_cell_target_verified_ = true;
         }
-        command_block_target_retries_ = 0;
         // The command-block sidecar may have been produced by an older build,
         // or restored from a checkpoint made before legacy execute conversion
         // was added.  Normalize again at the one point that actually writes
