@@ -285,8 +285,13 @@ constexpr int32_t kCommandBlockLoadWindowRadiusCells = 1;
 constexpr auto kCommandBlockCellMinimumWait = std::chrono::milliseconds(0);
 constexpr uint32_t kCommandBlockCellLoadRetryLimit = 3;
 constexpr uint32_t kCommandBlockTargetRetryLimit = 3;
-constexpr uint32_t kCommandBlockWritesPerTick = 256;
-constexpr auto kCommandBlockWriteTickBudget = std::chrono::milliseconds(4);
+// Command-block entity packets are sent synchronously on the game thread.
+// The old 256/4 ms cap left large blueprints spending most of their time in
+// the deferred-data phase even when the normal import rate was high.  A wider
+// bounded burst keeps packet construction off the parser thread while making
+// command setup materially closer to the configured building speed.
+constexpr uint32_t kCommandBlockWritesPerTick = 768;
+constexpr auto kCommandBlockWriteTickBudget = std::chrono::milliseconds(10);
 constexpr int32_t kSignCellSpanBlocks = 16;
 constexpr auto kSignTargetSettleDelay = std::chrono::seconds(1);
 constexpr auto kSignEditSessionTimeout = std::chrono::seconds(2);
